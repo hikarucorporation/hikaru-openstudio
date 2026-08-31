@@ -1,0 +1,12 @@
+[package]
+name = "hikaru_plugin_host"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+hikaru_core = { path = "../hikaru_core" }
+libloading = "0.8"
+vst3-host = "0.1" # O bindings directos si preferís moonlitt
+clack-host = "0.1" # La mejor opción para CLAP en Rust
+raw-window-handle = "0.5"
+winit = "0.28"

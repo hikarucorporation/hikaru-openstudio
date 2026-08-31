@@ -1,0 +1,9 @@
+[package]
+name = "hikaru_dsp"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+hikaru_core = { path = "../hikaru_core" }
+realfft = "3.3.0" # La artillería pesada para FFT
+rustfft = "6.1.0"

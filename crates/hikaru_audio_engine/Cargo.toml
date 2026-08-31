@@ -1,0 +1,10 @@
+[package]
+name = "hikaru_audio_engine"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+hikaru_core = { path = "../hikaru_core" }
+hikaru_transport = { path = "../hikaru_transport" }
+hikaru_sequencer = { path = "../hikaru_sequencer" }
+hikaru_dsp = { path = "../hikaru_dsp" }

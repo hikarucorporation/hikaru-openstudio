@@ -1,0 +1,19 @@
+# hikaru_workspace/Cargo.toml (¡Actualizado para la Fase 3!)
+[workspace]
+resolver = "2" # <--- ¡AGREGÁ ESTO ACÁ!
+members = [
+    "crates/hikaru_core",
+    "crates/hikaru_transport",
+    "crates/hikaru_audio_engine", # ¡Aquí está nuestro nuevo y poderoso motor de audio!
+    "crates/hikaru_sequencer", # <--- ¡AGREGÁ ESTA LÍNEA!
+    "crates/hikaru_dsp", # <--- EL GORDO DSP
+    "crates/hikaru_plugin_host", # <--- EL GORDO PLUGINS
+    "crates/hikaru_gui", # <--- interfaz
+]
+
+# Puedes añadir la sección [profile.release] aquí si quieres optimizar la compilación
+# para el rendimiento en producción, pero por ahora no es estrictamente necesario.
+# [profile.release]
+# opt-level = 3
+# lto = true
+# codegen-units = 1

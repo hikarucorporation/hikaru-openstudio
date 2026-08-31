@@ -1,0 +1,15 @@
+[package]
+name = "hikaru_gui"
+version = "0.1.0"
+edition = "2021"
+authors = ["Hikaru OpenStudio Developers"]
+license = "AGPL-3.0-later"
+
+[dependencies]
+hikaru_core = { path = "../hikaru_core" }
+hikaru_audio_engine = { path = "../hikaru_audio_engine" }
+hikaru_transport = { path = "../hikaru_transport" }
+egui = "0.27.0"
+eframe = { version = "0.27.0", features = ["glow"] }
+hound = "3.5"
+cpal = "0.18.2"
