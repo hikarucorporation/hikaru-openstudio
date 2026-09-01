@@ -13,7 +13,7 @@
   - `egui::TopBottomPanel::bottom()`: Footer de monitoreo (CPU, RAM, Estado).
 
 ## 2. ARQUITECTURA DEL WORKSPACE (CRATES)
-
+```
 hikaru_workspace/
 ├── crates/
 │   ├── hikaru_gui/          # [PRIORIDAD ACTUAL] Interfaz visual interactiva, mockups, paneles egui.
@@ -23,7 +23,7 @@ hikaru_workspace/
 │   ├── hikaru_dsp/          # Sintetizador Wavetable/Espectral nativo, filtros y efectos DSP.
 │   ├── hikaru_sequencer/    # Secuenciador, piano roll, arreglador y matriz de clips.
 │   └── hikaru_plugin_host/  # Host nativo para plugins VST3 y CLAP.
-
+```
 ## 3. FLUJOS DE COMUNICACIÓN (MOCKUP -> BACKEND)
 
 ```
