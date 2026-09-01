@@ -1,3 +1,11 @@
+// Copyright (c) Hikaru Corporation - 2026
+// GNU Affero General Public License v3
+// Código fuente del App
+// crates/hikaru_gui/src/app.rs
+
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
 use std::path::PathBuf;
 
 use egui::{CentralPanel, Color32, RichText, ScrollArea, TopBottomPanel, ViewportBuilder, ViewportId};
@@ -24,6 +32,7 @@ pub enum PanMode {
 pub struct HikaruApp {
     pub mode: AppMode,
     pub transport: TransportPosition,
+    pub position_clock: Arc<AtomicU64>, // <--- NUEVO
     pub is_looping: bool,
     pub cpu_usage: f32,
     pub show_mixer: bool,
@@ -53,6 +62,7 @@ impl HikaruApp {
         _cc: &eframe::CreationContext<'_>,
         audio_proxy: AudioProxy,
         audio_stream: Option<cpal::Stream>,
+        position_clock: Arc<AtomicU64>, // <--- Pasar desde main.rs si ya lo instanciás allá
     ) -> Self {
         let sample_rate = SampleRate::new(44100.0);
         let transport = TransportPosition::new(sample_rate, 140.0);
@@ -77,6 +87,7 @@ impl HikaruApp {
         Self {
             mode: AppMode::OpenLive,
             transport,
+            position_clock, // <--- GUARDAMOS LA REFERENCIA
             is_looping: false,
             cpu_usage: 0.12,
             show_mixer: false,
@@ -122,13 +133,12 @@ impl eframe::App for HikaruApp {
             self.fonts_configured = true;
         }
 
-        // --- LÓGICA DE TRANSPORTE Y REPRODUCCIÓN ---
+        // --- LÓGICA DE TRANSPORTE Y REPRODUCCIÓN EN TIEMPO REAL ---
         if self.transport.playback_state == TransportPlaybackState::Playing {
-            let dt = ctx.input(|i| i.stable_dt);
-            let samples_delta = (dt as f64 * self.transport.sample_rate.get() as f64) as u64;
+            // 1. Sincronización exacta con el reloj del AudioEngine
+            self.transport.sample_count = self.position_clock.load(Ordering::Relaxed);
 
-            self.transport.sample_count += samples_delta;
-
+            // 2. Control de Loop si está activo
             if self.is_looping {
                 let samples_per_beat = (self.transport.sample_rate.get() as f64 * 60.0) / self.transport.bpm;
                 let samples_per_bar = samples_per_beat * self.transport.beats_per_bar as f64;
@@ -140,6 +150,7 @@ impl eframe::App for HikaruApp {
                 }
             }
 
+            // Pedimos a egui redibujar el próximo frame para mantener animado el cursor
             ctx.request_repaint();
         }
 
@@ -167,6 +178,7 @@ impl eframe::App for HikaruApp {
                     header::show(
                         ui,
                         &mut self.transport,
+                        &self.position_clock, // <--- ¡Ahora sí existe en self!
                         &mut self.is_looping,
                         &mut self.is_recording,
                         &mut self.mode,

@@ -4,6 +4,7 @@
 // crates/hikaru_gui/src/main.rs
 
 use std::sync::mpsc::channel;
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use hikaru_core::SampleRate;
@@ -17,7 +18,16 @@ fn main() -> Result<(), eframe::Error> {
     let audio_proxy = AudioProxy::new(tx);
 
     let sample_rate = SampleRate::new(44100.0);
-    let engine = hikaru_audio_engine::AudioEngine::new(sample_rate, &DEFAULT_WAVETABLE);
+    
+    // 1. Instanciamos el reloj atómico compartido
+    let position_clock = Arc::new(AtomicU64::new(0));
+
+    // 2. Se lo pasamos a AudioEngine::new
+    let engine = hikaru_audio_engine::AudioEngine::new(
+        sample_rate, 
+        &DEFAULT_WAVETABLE, 
+        position_clock.clone()
+    );
     let engine_arc = Arc::new(Mutex::new(engine));
 
     let engine_for_commands = engine_arc.clone();
@@ -183,7 +193,8 @@ fn main() -> Result<(), eframe::Error> {
         "Hikaru OpenStudio",
         native_options,
         Box::new(move |cc| {
-            Box::new(HikaruApp::new(cc, audio_proxy, audio_stream))
+            // 3. Se lo pasamos a HikaruApp::new
+            Box::new(HikaruApp::new(cc, audio_proxy, audio_stream, position_clock))
         }),
     )
 }

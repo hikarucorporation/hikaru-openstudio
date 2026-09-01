@@ -3,6 +3,9 @@
 // Hikaru OpenStudio - Código fuente del Header
 // crates/hikaru_gui/src/views/header.rs
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
 use egui::{Button, Color32, Frame, Margin, RichText, Separator, Slider, Ui, Vec2};
 use crate::app::AppMode;
 
@@ -26,7 +29,8 @@ fn format_timecode(bars: f32, bpm: f64) -> String {
 
 pub fn show(
     ui: &mut Ui, 
-    transport: &mut TransportPosition, 
+    transport: &mut TransportPosition,
+    position_clock: &Arc<AtomicU64>, // <--- PASAMOS EL ATÓMICO ACÁ 
     is_looping: &mut bool,
     is_recording: &mut bool,
     mode: &mut AppMode, 
@@ -36,7 +40,12 @@ pub fn show(
     playlist_state: &PlaylistState,
     audio_proxy: &AudioProxy,
 ) {
-    // 1. CALCULAMOS Y GUARDAMOS LA BARRA ACTUAL AL ENTRAR
+    // Si el engine está en PLAYING, la GUI LEE la posición real de la placa de sonido:
+    if transport.playback_state == TransportPlaybackState::Playing {
+        transport.sample_count = position_clock.load(Ordering::Relaxed);
+    }
+
+    // 1. CALCULAMOS LA BARRA ACTUAL CON EL RELEVO REAL DEL AUDIO
     let samples_per_beat = (transport.sample_rate.get() as f64 * 60.0) / transport.bpm;
     let samples_per_bar = samples_per_beat * transport.beats_per_bar as f64;
     

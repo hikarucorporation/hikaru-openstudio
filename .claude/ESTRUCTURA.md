@@ -26,10 +26,13 @@ hikaru_workspace/
 
 ## 3. FLUJOS DE COMUNICACIÓN (MOCKUP -> BACKEND)
 
+```
   ┌──────────────────┐     Lock-Free RingBuffer (Events)     ┌──────────────────────┐
   │    hikaru_gui    │ ────────────────────────────────────> │ hikaru_audio_engine  │
   │ (egui / Layout)  │ <──────────────────────────────────── │    (Audio Thread)    │
   └──────────────────┘       Atomic State Updates / Metering └──────────────────────┘
+  
+```
 
 ## 4. MODO LIVE PERFORMANCE (HIKARU OPENLIVE)
 Integrado dentro de Hikaru OpenStudio (activable via atajo o pestaña en la UI).

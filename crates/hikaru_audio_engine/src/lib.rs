@@ -3,6 +3,9 @@
 // GNU Affero General Public License v3
 // crates/hikaru_audio_engine/src/lib.rs
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
 use hikaru_core::{AudioBuffer, SampleRate};
 use hikaru_transport::{TransportPosition, TransportPlaybackState};
 use hikaru_sequencer::TrackMatrix;
@@ -22,10 +25,12 @@ pub struct AudioEngine<'a> {
     pub oscillator: WavetableOscillator<'a>,
     pub sample_rate: f32,
     pub clips: Vec<AudioClipInstance>,
+    // NUEVO: Referencia compartida del reloj de muestras con la GUI
+    pub position_clock: Arc<AtomicU64>,
 }
 
 impl<'a> AudioEngine<'a> {
-    pub fn new(sr: SampleRate, wavetable: &'a [f32]) -> Self {
+    pub fn new(sr: SampleRate, wavetable: &'a [f32], position_clock: Arc<AtomicU64>) -> Self {
         let mut filter = StateVariableFilter::new();
         filter.set_params(2000.0, 0.707, sr.get());
 
@@ -36,6 +41,7 @@ impl<'a> AudioEngine<'a> {
             oscillator: WavetableOscillator::new(wavetable, sr),
             sample_rate: sr.get(),
             clips: Vec::new(),
+            position_clock,
         }
     }
 
@@ -80,10 +86,11 @@ impl<'a> AudioEngine<'a> {
         let samples = out_buffer.get_samples_mut();
         let num_channels = 2; // Estéreo
 
-        // 1. Limpieza de buffer de salida
         samples.fill(0.0);
 
         if self.transport.playback_state != TransportPlaybackState::Playing {
+            // Sincronizamos la posición atómica aunque esté frenado (para cuando se hace seek)
+            self.position_clock.store(self.transport.sample_count, Ordering::Relaxed);
             return;
         }
 
@@ -134,7 +141,10 @@ impl<'a> AudioEngine<'a> {
             }
         }
 
-        // 3. Avanzamos el contador del transport del Engine
+        // Avanzamos el contador interno del Engine
         self.transport.sample_count += buffer_frames;
+
+        // NUEVO: Sincronizamos la lectura atómica en tiempo real para la GUI
+        self.position_clock.store(self.transport.sample_count, Ordering::Relaxed);
     }
 }
