@@ -52,7 +52,8 @@ pub struct PlaylistState {
     pub grid_numerator: u32,
     pub grid_denominator: u32,
     pub zoom_x: f32,
-    pub selected_clips: Vec<usize>,
+    pub selected_clips: Vec<usize>, // IDs de los clips seleccionados
+    pub clipboard: Vec<(usize, PlaylistClip)>, // Portapapeles interno
 }
 
 impl Default for PlaylistState {
@@ -67,6 +68,7 @@ impl Default for PlaylistState {
             grid_denominator: 4,
             zoom_x: 0.04,
             selected_clips: Vec::new(),
+            clipboard: Vec::new(),
         }
     }
 }
@@ -221,6 +223,100 @@ pub fn show(
     let row_spacing = 0.0_f32;
     let total_row_step = track_height + row_spacing;
     let header_width = state.header_width;
+
+    // ATAJOS GLOBALES DE SELECCIÓN Y PORTAPAPELES
+    let ctrl = ui.input(|i| i.modifiers.ctrl || i.modifiers.command);
+    let shift = ui.input(|i| i.modifiers.shift);
+
+    if ctrl && ui.input(|i| i.key_pressed(egui::Key::C)) {
+        // COPIAR
+        state.clipboard = state.clips.iter()
+            .filter(|(_, c)| state.selected_clips.contains(&c.id))
+            .cloned()
+            .collect();
+    }
+
+    if ctrl && ui.input(|i| i.key_pressed(egui::Key::X)) {
+        // CORTAR
+        state.clipboard = state.clips.iter()
+            .filter(|(_, c)| state.selected_clips.contains(&c.id))
+            .cloned()
+            .collect();
+        state.clips.retain(|(_, c)| !state.selected_clips.contains(&c.id));
+        state.selected_clips.clear();
+    }
+
+    if ctrl && ui.input(|i| i.key_pressed(egui::Key::V)) {
+        // PEGAR (En la posición del Playhead)
+        if !state.clipboard.is_empty() {
+            let min_start = state.clipboard.iter().map(|(_, c)| c.start_tick).min().unwrap_or(0);
+            let mut new_selection = Vec::new();
+
+            for (track_id, clip) in state.clipboard.clone() {
+                let offset = clip.start_tick.saturating_sub(min_start);
+                let mut new_clip = clip.clone();
+                new_clip.id = state.next_clip_id;
+                new_clip.start_tick = state.playhead_tick + offset;
+
+                if let ClipType::Audio { ref sample_path, .. } = new_clip.clip_type {
+                    let seconds_per_tick = 60.0 / (bpm as f32 * state.ppqn as f32);
+                    let position_secs = new_clip.start_tick as f32 * seconds_per_tick;
+                    audio_proxy.send(GuiCommand::LoadClip {
+                        path: sample_path.clone(),
+                        position_secs,
+                        track_index: track_id,
+                    });
+                }
+
+                new_selection.push(new_clip.id);
+                state.clips.push((track_id, new_clip));
+                state.next_clip_id += 1;
+            }
+            state.selected_clips = new_selection;
+        }
+    }
+
+    if ctrl && ui.input(|i| i.key_pressed(egui::Key::D)) {
+        // DUPLICAR (Pega inmediatamente al final del bloque seleccionado)
+        let selected_items: Vec<(usize, PlaylistClip)> = state.clips.iter()
+            .filter(|(_, c)| state.selected_clips.contains(&c.id))
+            .cloned()
+            .collect();
+
+        if !selected_items.is_empty() {
+            let min_start = selected_items.iter().map(|(_, c)| c.start_tick).min().unwrap_or(0);
+            let max_end = selected_items.iter().map(|(_, c)| c.start_tick + c.duration_ticks).max().unwrap_or(0);
+            let duration_block = max_end - min_start;
+            let mut new_selection = Vec::new();
+
+            for (track_id, clip) in selected_items {
+                let mut new_clip = clip.clone();
+                new_clip.id = state.next_clip_id;
+                new_clip.start_tick = clip.start_tick + duration_block;
+
+                if let ClipType::Audio { ref sample_path, .. } = new_clip.clip_type {
+                    let seconds_per_tick = 60.0 / (bpm as f32 * state.ppqn as f32);
+                    let position_secs = new_clip.start_tick as f32 * seconds_per_tick;
+                    audio_proxy.send(GuiCommand::LoadClip {
+                        path: sample_path.clone(),
+                        position_secs,
+                        track_index: track_id,
+                    });
+                }
+
+                new_selection.push(new_clip.id);
+                state.clips.push((track_id, new_clip));
+                state.next_clip_id += 1;
+            }
+            state.selected_clips = new_selection;
+        }
+    }
+
+    if ui.input(|i| i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace)) {
+        // BORRAR SELECCIÓN
+        state.clips.retain(|(_, c)| !state.selected_clips.contains(&c.id));
+        state.selected_clips.clear();
+    }
 
     ui.vertical(|ui| {
         let non_master_count = tracks.iter().filter(|t| !t.is_master).count();
@@ -388,6 +484,11 @@ pub fn show(
                                 Sense::click_and_drag()
                             );
 
+                            // Limpiar selección al hacer clic sobre canvas vacío
+                            if response.clicked_by(PointerButton::Primary) && !shift {
+                                state.selected_clips.clear();
+                            }
+
                             // Zoom con Ctrl + Scroll
                             if response.hovered() {
                                 let ctrl_pressed = ui.input(|i| i.modifiers.ctrl || i.modifiers.command);
@@ -477,7 +578,7 @@ pub fn show(
                                             Vec2::new(clip_w, track_height - 2.0)
                                         );
 
-                                        // Zonas de Trim (Edges izq y der) - Choreo visual del Generic DAW
+                                        // Zonas de Trim (Edges izq y der)
                                         let trim_handle_w = 6.0_f32;
                                         let left_trim_rect = Rect::from_min_size(clip_rect.min, Vec2::new(trim_handle_w, clip_rect.height()));
                                         let right_trim_rect = Rect::from_min_size(
@@ -488,7 +589,24 @@ pub fn show(
                                         let clip_id_egui = ui.make_persistent_id(format!("clip_{}_{}", clip_track_id, clip.id));
                                         let clip_response = ui.interact(clip_rect, clip_id_egui, Sense::click_and_drag());
 
-                                        // Click Derecho para eliminar (estilo Generic DAW)
+                                        let is_selected = state.selected_clips.contains(&clip.id);
+
+                                        // Manejo de Clics para Selección
+                                        if clip_response.clicked_by(PointerButton::Primary) {
+                                            if shift {
+                                                if is_selected {
+                                                    state.selected_clips.retain(|&id| id != clip.id);
+                                                } else {
+                                                    state.selected_clips.push(clip.id);
+                                                }
+                                            } else {
+                                                if !is_selected {
+                                                    state.selected_clips = vec![clip.id];
+                                                }
+                                            }
+                                        }
+
+                                        // Click Derecho para eliminar
                                         if clip_response.secondary_clicked() {
                                             clip_to_delete = Some(clip.id);
                                         }
@@ -551,13 +669,12 @@ pub fn show(
                                             }
                                         }
 
-                                        // RENDER ESTILO GENERIC DAW (Solid fill + Stroke)
-                                        let is_hovered = clip_response.hovered();
-                                        let is_dragged = clip_response.dragged();
-
-                                        let (border_color, border_width) = if is_dragged {
+                                        // RENDER Y RESALTADO DE BORDES
+                                        let (border_color, border_width) = if is_selected {
+                                            (Color32::from_rgb(255, 200, 0), 2.0_f32) // Amarillo brillante para seleccionados
+                                        } else if clip_response.dragged() {
                                             (Color32::from_rgb(0, 255, 255), 2.0_f32)
-                                        } else if is_hovered {
+                                        } else if clip_response.hovered() {
                                             (Color32::WHITE, 1.5_f32)
                                         } else {
                                             (Color32::from_white_alpha(100), 1.0_f32)
@@ -566,7 +683,7 @@ pub fn show(
                                         painter.rect_filled(clip_rect, 2.0, clip.color);
                                         painter.rect_stroke(clip_rect, 2.0, Stroke::new(border_width, border_color));
 
-                                        // WAVEFORM RENDERER (Robado de generic_daw_gui/src/widget/clip.rs)
+                                        // WAVEFORM RENDERER
                                         if let ClipType::Audio { peaks, .. } = &clip.clip_type {
                                             if !peaks.is_empty() {
                                                 let inner_rect = clip_rect.shrink2(Vec2::new(2.0, 4.0));
@@ -659,7 +776,6 @@ pub fn show(
                                                     let file_name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
                                                     let sample_path_str = path.to_string_lossy().to_string();
                                                     
-                                                    // PASS BPM HERE:
                                                     let (duration_ticks, peaks) = load_sample_info(&path, state.ppqn, bpm);
 
                                                     let clip = PlaylistClip {
