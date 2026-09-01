@@ -153,7 +153,7 @@ fn custom_h_slider(ui: &mut Ui, value: &mut f32, width: f32) -> egui::Response {
     response
 }
 
-fn load_sample_info(path: &PathBuf, ppqn: u64) -> (u64, Vec<f32>) {
+fn load_sample_info(path: &PathBuf, ppqn: u64, bpm: f64) -> (u64, Vec<f32>) {
     let ticks_per_bar = ppqn * 4;
     let default_ticks = ticks_per_bar * 4;
     let mut peaks = Vec::new();
@@ -162,7 +162,10 @@ fn load_sample_info(path: &PathBuf, ppqn: u64) -> (u64, Vec<f32>) {
         let spec = reader.spec();
         if spec.sample_rate > 0 {
             let duration_sec = reader.duration() as f32 / spec.sample_rate as f32;
-            let bars = duration_sec / (60.0 / 140.0 * 4.0); 
+            
+            // Calculamos cuántos compases representa la duración del archivo según el BPM del proyecto
+            let seconds_per_bar = (60.0 / bpm as f32) * 4.0;
+            let bars = duration_sec / seconds_per_bar; 
             let calculated_ticks = ((bars * ticks_per_bar as f32) as u64).max(ppqn);
 
             let target_peaks = 256;
@@ -213,9 +216,10 @@ pub fn show(
     let samples_per_beat = (sample_rate as f64 * 60.0) / bpm;
     let samples_per_bar = samples_per_beat * 4.0;
 
-    // --- ACTIVAR ESTAS VARIABLES ---
     let zoom_x = state.zoom_x;
     let track_height = 54.0_f32;
+    let row_spacing = 0.0_f32;
+    let total_row_step = track_height + row_spacing;
     let header_width = state.header_width;
 
     ui.vertical(|ui| {
@@ -276,65 +280,72 @@ pub fn show(
                         );
 
                         for track in tracks.iter_mut().filter(|t| !t.is_master) {
-                            Frame::none()
-                                .fill(Color32::from_rgb(28, 28, 32))
-                                .stroke(Stroke::new(1.0_f32, Color32::from_gray(45)))
-                                .inner_margin(4.0)
-                                .show(ui, |ui| {
-                                    ui.set_min_size(Vec2::new(header_width - 8.0, track_height));
-                                    ui.vertical(|ui| {
-                                        ui.horizontal(|ui| {
-                                            let text_width = (header_width - 70.0).max(40.0);
-                                            ui.add(
-                                                egui::TextEdit::singleline(&mut track.name)
-                                                    .text_color(Color32::WHITE)
-                                                    .font(egui::FontId::proportional(11.0))
-                                                    .frame(false)
-                                                    .desired_width(text_width)
-                                            );
+                            let (rect, _) = ui.allocate_exact_size(
+                                Vec2::new(header_width, total_row_step), 
+                                Sense::hover()
+                            );
 
-                                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                                ui.toggle_value(&mut track.solo, "S");
-                                                ui.toggle_value(&mut track.mute, "M");
+                            ui.allocate_ui_at_rect(rect, |ui| {
+                                Frame::none()
+                                    .fill(Color32::from_rgb(28, 28, 32))
+                                    .stroke(Stroke::new(1.0_f32, Color32::from_gray(45)))
+                                    .inner_margin(0.0)
+                                    .outer_margin(0.0)
+                                    .show(ui, |ui| {
+                                        ui.set_min_size(Vec2::new(rect.width() - 8.0, track_height));
+                                        ui.vertical(|ui| {
+                                            ui.horizontal(|ui| {
+                                                let text_width = (header_width - 70.0).max(40.0);
+                                                ui.add(
+                                                    egui::TextEdit::singleline(&mut track.name)
+                                                        .text_color(Color32::WHITE)
+                                                        .font(egui::FontId::proportional(11.0))
+                                                        .frame(false)
+                                                        .desired_width(text_width)
+                                                );
+
+                                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                    ui.toggle_value(&mut track.solo, "S");
+                                                    ui.toggle_value(&mut track.mute, "M");
+                                                });
                                             });
-                                        });
-
-                                        ui.add_space(2.0);
-
-                                        ui.horizontal(|ui| {
-                                            knob_ui(ui, &mut track.pan, 8.0);
-
-                                            let pan_text = if track.pan < -1.0 {
-                                                format!("L{:.0}", track.pan.abs())
-                                            } else if track.pan > 1.0 {
-                                                format!("R{:.0}", track.pan)
-                                            } else {
-                                                "C".to_string()
-                                            };
-                                            ui.label(RichText::new(pan_text).size(9.0).color(Color32::from_rgb(0, 255, 255)));
 
                                             ui.add_space(2.0);
 
-                                            let slider_width = (header_width - 90.0).max(30.0);
-                                            custom_h_slider(ui, &mut track.volume, slider_width);
+                                            ui.horizontal(|ui| {
+                                                knob_ui(ui, &mut track.pan, 8.0);
 
-                                            let db_val = if track.volume <= 0.0 {
-                                                -60.0
-                                            } else if track.volume <= 0.75 {
-                                                -60.0 + (track.volume / 0.75) * 60.0
-                                            } else {
-                                                ((track.volume - 0.75) / 0.25) * 6.0
-                                            };
-                                            ui.label(RichText::new(format!("{:.1}dB", db_val)).size(8.5).weak());
+                                                let pan_text = if track.pan < -1.0 {
+                                                    format!("L{:.0}", track.pan.abs())
+                                                } else if track.pan > 1.0 {
+                                                    format!("R{:.0}", track.pan)
+                                                } else {
+                                                    "C".to_string()
+                                                };
+                                                ui.label(RichText::new(pan_text).size(9.0).color(Color32::from_rgb(0, 255, 255)));
+
+                                                ui.add_space(2.0);
+
+                                                let slider_width = (header_width - 90.0).max(30.0);
+                                                custom_h_slider(ui, &mut track.volume, slider_width);
+
+                                                let db_val = if track.volume <= 0.0 {
+                                                    -60.0
+                                                } else if track.volume <= 0.75 {
+                                                    -60.0 + (track.volume / 0.75) * 60.0
+                                                } else {
+                                                    ((track.volume - 0.75) / 0.25) * 6.0
+                                                };
+                                                ui.label(RichText::new(format!("{:.1}dB", db_val)).size(8.5).weak());
+                                            });
                                         });
                                     });
-                                });
-                            ui.add_space(2.0);
+                            });
                         }
                     });
 
                     // RESIZER
-                    let total_height = 24.0 + (non_master_count as f32 * (track_height + 6.0));
+                    let total_height = 24.0 + (non_master_count as f32 * total_row_step);
                     let (resizer_rect, resizer_response) = ui.allocate_at_least(
                         Vec2::new(6.0, total_height), 
                         Sense::click_and_drag()
@@ -369,11 +380,11 @@ pub fn show(
                             let available_w = ui.available_width();
                             let min_canvas_w = ticks_to_px(state.ppqn * 4 * 128, zoom_x); 
                             let canvas_width = available_w.max(min_canvas_w);
-                            let total_tracks_height = non_master_count as f32 * (track_height + 6.0);
+                            let total_tracks_height = non_master_count as f32 * total_row_step;
                             let canvas_height: f32 = 24.0 + total_tracks_height;
 
                             let (response, painter) = ui.allocate_painter(
-                                Vec2::new(canvas_width, canvas_height.max(ui.available_height())), 
+                                Vec2::new(canvas_width, canvas_height), 
                                 Sense::click_and_drag()
                             );
 
@@ -462,8 +473,8 @@ pub fn show(
                                         let clip_w = ticks_to_px(clip.duration_ticks, zoom_x).max(8.0);
 
                                         let clip_rect = Rect::from_min_size(
-                                            Pos2::new(clip_x, current_y + 2.0), 
-                                            Vec2::new(clip_w, track_height - 4.0)
+                                            Pos2::new(clip_x, current_y + 1.0), 
+                                            Vec2::new(clip_w, track_height - 2.0)
                                         );
 
                                         // Zonas de Trim (Edges izq y der) - Choreo visual del Generic DAW
@@ -529,7 +540,7 @@ pub fn show(
 
                                                     let rel_y = mouse_pos.y - (rect.min.y + 24.0);
                                                     if rel_y >= 0.0 {
-                                                        let target_idx = (rel_y / (track_height + 6.0)).floor() as usize;
+                                                        let target_idx = (rel_y / total_row_step).floor() as usize;
                                                         if target_idx < valid_tracks.len() {
                                                             *clip_track_id = valid_tracks[target_idx];
                                                         }
@@ -597,7 +608,7 @@ pub fn show(
                                     }
                                 }
 
-                                current_y += track_height + 6.0;
+                                current_y += total_row_step;
                             }
 
                             // Borrar clip si se hizo click derecho
@@ -640,14 +651,16 @@ pub fn show(
 
                                             let rel_y = drop_pos.y - (rect.min.y + 24.0);
                                             if rel_y >= 0.0 {
-                                                let track_idx = (rel_y / (track_height + 6.0)).floor() as usize;
+                                                let track_idx = (rel_y / total_row_step).floor() as usize;
 
                                                 let valid_tracks_list: Vec<&Track> = tracks.iter().filter(|t| !t.is_master).collect();
                                                 if track_idx < valid_tracks_list.len() {
                                                     let target_track_id = valid_tracks_list[track_idx].id;
                                                     let file_name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
                                                     let sample_path_str = path.to_string_lossy().to_string();
-                                                    let (duration_ticks, peaks) = load_sample_info(&path, state.ppqn);
+                                                    
+                                                    // PASS BPM HERE:
+                                                    let (duration_ticks, peaks) = load_sample_info(&path, state.ppqn, bpm);
 
                                                     let clip = PlaylistClip {
                                                         id: state.next_clip_id,
@@ -665,7 +678,6 @@ pub fn show(
                                                     state.next_clip_id += 1;
                                                     state.clips.push((target_track_id, clip));
 
-                                                    // Reemplazá la línea hardcodeada de 140.0 BPM por el parámetro real:
                                                     let seconds_per_tick = 60.0 / (bpm as f32 * state.ppqn as f32);
                                                     let position_secs = drop_tick as f32 * seconds_per_tick;
 
