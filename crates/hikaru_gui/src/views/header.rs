@@ -84,14 +84,17 @@ pub fn show(
                     let bpm = transport.bpm as f32;
                     let seconds_per_tick = 60.0 / (bpm * playlist_state.ppqn as f32);
 
-                    let clips_to_sync: Vec<AudioClipData> = playlist_state
+                    let clips_to_sync: Vec<AudioClipData> = playlist_state // HOTFIX CLAUDE #2
                         .clips
                         .iter()
                         .filter_map(|(track_id, clip)| {
-                            if let ClipType::Audio { sample_path, .. } = &clip.clip_type {
+                            if let ClipType::Audio { sample_path, sample_offset_ticks, .. } = &clip.clip_type {
                                 Some(AudioClipData {
+                                    clip_id: clip.id,
                                     path: sample_path.clone(),
                                     start_secs: clip.start_tick as f32 * seconds_per_tick,
+                                    duration_secs: clip.duration_ticks as f32 * seconds_per_tick,
+                                    offset_secs: *sample_offset_ticks as f32 * seconds_per_tick,
                                     track_index: *track_id,
                                 })
                             } else {

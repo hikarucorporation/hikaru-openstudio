@@ -36,8 +36,6 @@ fn main() -> Result<(), eframe::Error> {
             match command {
                 GuiCommand::Play => {
                     if let Ok(mut engine) = engine_for_commands.lock() {
-                        // No hacemos seek(0.0) acá: si viene de un Pause, tiene que
-                        // retomar desde donde estaba. El reseteo a 0 lo hace Stop().
                         engine.play();
                     }
                 }
@@ -51,7 +49,18 @@ fn main() -> Result<(), eframe::Error> {
                         engine.stop();
                     }
                 }
-                GuiCommand::LoadClip { path, position_secs, .. } => {
+                GuiCommand::Seek { sample_count } => {
+                    if let Ok(mut engine) = engine_for_commands.lock() {
+                        let secs = sample_count as f32 / engine.sample_rate;
+                        engine.seek(secs);
+                    }
+                }
+                GuiCommand::UpdateClipBounds { clip_id, position_secs, duration_secs, offset_secs } => {
+                    if let Ok(mut engine) = engine_for_commands.lock() {
+                        engine.update_clip_bounds(clip_id, position_secs, duration_secs, offset_secs);
+                    }
+                }
+                GuiCommand::LoadClip { clip_id, path, position_secs, duration_secs, offset_secs, .. } => {
                     println!("[Hikaru Engine] Cargando clip de Playlist: {} en {:.2}s", path, position_secs);
 
                     if let Ok(mut reader) = hound::WavReader::open(&path) {
@@ -79,8 +88,8 @@ fn main() -> Result<(), eframe::Error> {
                                 raw_samples
                             };
 
-                            // Insertamos el clip en la lista global del motor con su offset temporal real
-                            engine.add_clip(final_samples, position_secs, channels);
+                            // Usamos el clip_id y los límites REALES que manda la GUI, no los recalculamos.
+                            engine.add_clip(clip_id, final_samples, position_secs, duration_secs, offset_secs, channels);
                         }
                     } else {
                         eprintln!("[Hikaru Engine Error] No se pudo abrir el WAV para la Playlist: {}", path);
@@ -114,8 +123,10 @@ fn main() -> Result<(), eframe::Error> {
                                 raw_samples
                             };
 
+                            let duration_secs = final_samples.len() as f32 / (channels as f32 * target_sr);
+
                             engine.clips.clear();
-                            engine.add_clip(final_samples, 0.0, channels);
+                            engine.add_clip(0, final_samples, 0.0, duration_secs, 0.0, channels);
                             engine.seek(0.0);
                             engine.play();
                         }
@@ -128,12 +139,10 @@ fn main() -> Result<(), eframe::Error> {
                     println!("[Hikaru Engine] Sincronizando {} clips de Playlist...", clips.len());
 
                     if let Ok(mut engine) = engine_for_commands.lock() {
-                        // 1. Limpiamos las voces anteriores para no acumular duplicados
                         engine.clips.clear();
                         let target_sr = engine.sample_rate;
 
-                        // 2. Cargamos todos los clips actuales
-                        for clip_data in clips {
+                        for clip_data in clips.into_iter() {
                             if let Ok(mut reader) = hound::WavReader::open(&clip_data.path) {
                                 let spec = reader.spec();
                                 let file_sr = spec.sample_rate as f32;
@@ -158,8 +167,15 @@ fn main() -> Result<(), eframe::Error> {
                                     raw_samples
                                 };
 
-                                // Insertamos cada clip con su `start_secs` correcto
-                                engine.add_clip(final_samples, clip_data.start_secs, channels);
+                                // clip_id, duration_secs y offset_secs ahora vienen de la GUI (ver AudioClipData actualizado)
+                                engine.add_clip(
+                                    clip_data.clip_id,
+                                    final_samples,
+                                    clip_data.start_secs,
+                                    clip_data.duration_secs,
+                                    clip_data.offset_secs,
+                                    channels,
+                                );
                             } else {
                                 eprintln!("[Hikaru Engine Error] No se pudo abrir: {}", clip_data.path);
                             }
@@ -193,7 +209,6 @@ fn main() -> Result<(), eframe::Error> {
         "Hikaru OpenStudio",
         native_options,
         Box::new(move |cc| {
-            // 3. Se lo pasamos a HikaruApp::new
             Box::new(HikaruApp::new(cc, audio_proxy, audio_stream, position_clock))
         }),
     )
@@ -215,7 +230,6 @@ fn init_cpal_stream(
     let hardware_sr = stream_config.sample_rate as f32;
     println!("[Hikaru] Hardware SR detectado: {}Hz", hardware_sr);
 
-    // Ajustamos el sample rate del engine con la referencia al argumento `engine`
     if let Ok(mut lock) = engine.lock() {
         lock.set_sample_rate(hardware_sr);
     }

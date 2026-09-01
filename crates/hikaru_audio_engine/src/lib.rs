@@ -13,8 +13,11 @@ use hikaru_dsp::synth::wavetable::WavetableOscillator;
 use hikaru_dsp::effects::filter::StateVariableFilter;
 
 pub struct AudioClipInstance {
+    pub id: usize,              // Para poder identificarlo al actualizar límites
     pub samples: Vec<f32>,
     pub start_frame: u64,
+    pub duration_frames: u64,   // Duración recortada visible en el timeline
+    pub sample_offset: usize,   // Punto de inicio dentro del buffer PCM
     pub channels: usize,
 }
 
@@ -25,7 +28,7 @@ pub struct AudioEngine<'a> {
     pub oscillator: WavetableOscillator<'a>,
     pub sample_rate: f32,
     pub clips: Vec<AudioClipInstance>,
-    // NUEVO: Referencia compartida del reloj de muestras con la GUI
+    // Referencia compartida del reloj de muestras con la GUI
     pub position_clock: Arc<AtomicU64>,
 }
 
@@ -56,12 +59,27 @@ impl<'a> AudioEngine<'a> {
         self.clips = new_clips;
     }
 
-    pub fn add_clip(&mut self, samples: Vec<f32>, start_secs: f32, channels: usize) {
+    pub fn update_clip_bounds(&mut self, clip_id: usize, start_secs: f32, duration_secs: f32, offset_secs: f32) {
+        if let Some(clip) = self.clips.iter_mut().find(|c| c.id == clip_id) {
+            clip.start_frame = (start_secs * self.sample_rate) as u64;
+            clip.duration_frames = (duration_secs * self.sample_rate) as u64;
+            clip.sample_offset = (offset_secs * self.sample_rate) as usize * clip.channels;
+        }
+    }
+
+    pub fn add_clip(&mut self, id: usize, samples: Vec<f32>, start_secs: f32, duration_secs: f32, offset_secs: f32, channels: usize) {
+        let ch = channels.max(1);
         let start_frame = (start_secs * self.sample_rate) as u64;
+        let duration_frames = (duration_secs * self.sample_rate) as u64;
+        let sample_offset = (offset_secs * self.sample_rate) as usize * ch;
+
         self.clips.push(AudioClipInstance {
+            id,
             samples,
             start_frame,
-            channels: channels.max(1),
+            duration_frames,
+            sample_offset,
+            channels: ch,
         });
     }
 
@@ -89,7 +107,6 @@ impl<'a> AudioEngine<'a> {
         samples.fill(0.0);
 
         if self.transport.playback_state != TransportPlaybackState::Playing {
-            // Sincronizamos la posición atómica aunque esté frenado (para cuando se hace seek)
             self.position_clock.store(self.transport.sample_count, Ordering::Relaxed);
             return;
         }
@@ -98,53 +115,59 @@ impl<'a> AudioEngine<'a> {
         let frame_start = self.transport.sample_count;
         let frame_end = frame_start + buffer_frames;
 
-        // 2. Mezcla polifónica de todos los clips
         for clip in &self.clips {
-            let clip_frames = (clip.samples.len() / clip.channels) as u64;
-            let clip_frame_end = clip.start_frame + clip_frames;
+            // Límite estricto del clip en la línea de tiempo global
+            let clip_frame_end = clip.start_frame + clip.duration_frames;
 
-            // Evaluamos si este clip entra en el rango del buffer actual
+            // Evaluamos si el clip colisiona con el buffer actual
             if frame_start < clip_frame_end && frame_end > clip.start_frame {
                 let start_f = if clip.start_frame > frame_start {
-                    clip.start_frame - frame_start
+                    (clip.start_frame - frame_start) as usize
                 } else {
                     0
                 };
 
                 let end_f = if clip_frame_end < frame_end {
-                    clip_frame_end - frame_start
+                    (clip_frame_end - frame_start) as usize
                 } else {
-                    buffer_frames
+                    buffer_frames as usize
                 };
 
                 for f in start_f..end_f {
-                    let global_frame = frame_start + f;
-                    let clip_frame_offset = (global_frame - clip.start_frame) as usize;
+                    let global_frame = frame_start + f as u64;
+                    
+                    // Aseguramos que la aguja global esté dentro de la ventana del clip
+                    if global_frame >= clip.start_frame && global_frame < clip_frame_end {
+                        let relative_frame = (global_frame - clip.start_frame) as usize;
 
-                    let out_l_idx = (f as usize) * num_channels;
-                    let out_r_idx = out_l_idx + 1;
+                        // Desplazamiento real basado en el TRIM (sample_offset)
+                        let sample_index_frame = (clip.sample_offset / clip.channels) + relative_frame;
+                        let clip_sample_l = sample_index_frame * clip.channels;
+                        let clip_sample_r = if clip.channels > 1 {
+                            clip_sample_l + 1
+                        } else {
+                            clip_sample_l
+                        };
 
-                    let clip_sample_l = clip_frame_offset * clip.channels;
-                    let clip_sample_r = if clip.channels > 1 {
-                        clip_sample_l + 1
-                    } else {
-                        clip_sample_l
-                    };
+                        let out_l_idx = f * num_channels;
+                        let out_r_idx = out_l_idx + 1;
 
-                    if let Some(&val_l) = clip.samples.get(clip_sample_l) {
-                        samples[out_l_idx] += val_l;
-                    }
-                    if let Some(&val_r) = clip.samples.get(clip_sample_r) {
-                        samples[out_r_idx] += val_r;
+                        // Si el índice calculado cae dentro del buffer cargado, se procesa
+                        if clip_sample_l < clip.samples.len() {
+                            samples[out_l_idx] += clip.samples[clip_sample_l];
+                        }
+                        if clip.channels > 1 && clip_sample_r < clip.samples.len() {
+                            samples[out_r_idx] += clip.samples[clip_sample_r];
+                        } else if clip.channels == 1 && clip_sample_l < clip.samples.len() {
+                            // Copiamos Mono a R si el sample es mono
+                            samples[out_r_idx] += clip.samples[clip_sample_l];
+                        }
                     }
                 }
             }
         }
 
-        // Avanzamos el contador interno del Engine
         self.transport.sample_count += buffer_frames;
-
-        // NUEVO: Sincronizamos la lectura atómica en tiempo real para la GUI
         self.position_clock.store(self.transport.sample_count, Ordering::Relaxed);
     }
 }

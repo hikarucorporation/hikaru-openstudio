@@ -25,7 +25,8 @@ pub enum ClipType {
     Audio { 
         sample_path: String,
         peaks: Vec<f32>,
-        sample_offset_ticks: u64, // Para slip-editing / offset interno del audio
+        sample_offset_ticks: u64, // Slip editing / Trim inicio en ticks
+        total_sample_ticks: u64,  // Duración total original del audio en ticks
     },
     Automation { 
         points: Vec<CurvePoint>,
@@ -52,8 +53,8 @@ pub struct PlaylistState {
     pub grid_numerator: u32,
     pub grid_denominator: u32,
     pub zoom_x: f32,
-    pub selected_clips: Vec<usize>, // IDs de los clips seleccionados
-    pub clipboard: Vec<(usize, PlaylistClip)>, // Portapapeles interno
+    pub selected_clips: Vec<usize>,
+    pub clipboard: Vec<(usize, PlaylistClip)>,
 }
 
 impl Default for PlaylistState {
@@ -73,7 +74,6 @@ impl Default for PlaylistState {
     }
 }
 
-// Helper: Conversión estilo Generic DAW (px <-> time)
 #[inline]
 fn px_to_ticks(px: f32, zoom_x: f32) -> u64 {
     (px.max(0.0) / zoom_x) as u64
@@ -156,50 +156,72 @@ fn custom_h_slider(ui: &mut Ui, value: &mut f32, width: f32) -> egui::Response {
 }
 
 fn load_sample_info(path: &PathBuf, ppqn: u64, bpm: f64) -> (u64, Vec<f32>) {
-    let ticks_per_bar = ppqn * 4;
-    let default_ticks = ticks_per_bar * 4;
     let mut peaks = Vec::new();
 
-    if let Ok(mut reader) = hound::WavReader::open(path) {
-        let spec = reader.spec();
-        if spec.sample_rate > 0 {
-            let duration_sec = reader.duration() as f32 / spec.sample_rate as f32;
-            
-            // Calculamos cuántos compases representa la duración del archivo según el BPM del proyecto
-            let seconds_per_bar = (60.0 / bpm as f32) * 4.0;
-            let bars = duration_sec / seconds_per_bar; 
-            let calculated_ticks = ((bars * ticks_per_bar as f32) as u64).max(ppqn);
+    match hound::WavReader::open(path) {
+        Ok(mut reader) => {
+            let spec = reader.spec();
+            let total_frames = reader.duration() as u64; // frames (per-channel)
+            let channels = spec.channels.max(1) as u64;
 
-            let target_peaks = 256;
-            let total_samples = reader.duration() as usize;
-            let step = (total_samples / target_peaks).max(1);
+            // Log de diagnóstico — sacalo una vez confirmemos el root cause
+            eprintln!(
+                "[PLAYLIST DEBUG] {:?} | fmt={:?} bits={} ch={} sr={} frames={}",
+                path.file_name().unwrap_or_default(),
+                spec.sample_format, spec.bits_per_sample, spec.channels,
+                spec.sample_rate, total_frames
+            );
 
-            let samples: Vec<f32> = match spec.sample_format {
-                hound::SampleFormat::Int => {
-                    let max_val = (1 << (spec.bits_per_sample - 1)) as f32;
-                    reader.samples::<i32>()
-                        .filter_map(|s| s.ok())
-                        .map(|s| (s as f32 / max_val).abs())
-                        .collect()
+            if spec.sample_rate > 0 && total_frames > 0 && bpm > 0.0 {
+                let duration_sec = total_frames as f64 / spec.sample_rate as f64;
+                let seconds_per_tick = (60.0 / bpm) / ppqn.max(1) as f64;
+                let calculated_ticks = (duration_sec / seconds_per_tick).round() as u64;
+
+                eprintln!(
+                    "[PLAYLIST DEBUG] duration_sec={:.4} -> calculated_ticks={}",
+                    duration_sec, calculated_ticks
+                );
+
+                let target_peaks = 512;
+                // step en FRAMES, no en samples interleaved
+                let step_frames = ((total_frames as usize) / target_peaks).max(1);
+                let step_samples = step_frames * channels as usize;
+
+                let samples: Vec<f32> = match spec.sample_format {
+                    hound::SampleFormat::Int => {
+                        let max_val = (1i64 << (spec.bits_per_sample - 1)) as f32;
+                        reader.samples::<i32>()
+                            .filter_map(|s| s.ok())
+                            .map(|s| (s as f32 / max_val).abs())
+                            .collect()
+                    }
+                    hound::SampleFormat::Float => {
+                        reader.samples::<f32>()
+                            .filter_map(|s| s.ok())
+                            .map(|s| s.abs())
+                            .collect()
+                    }
+                };
+
+                for chunk in samples.chunks(step_samples) {
+                    let max_peak = chunk.iter().cloned().fold(0.0_f32, f32::max);
+                    peaks.push(max_peak.clamp(0.0, 1.0));
                 }
-                hound::SampleFormat::Float => {
-                    reader.samples::<f32>()
-                        .filter_map(|s| s.ok())
-                        .map(|s| s.abs())
-                        .collect()
-                }
-            };
 
-            for chunk in samples.chunks(step) {
-                let max_peak = chunk.iter().cloned().fold(0.0_f32, f32::max);
-                peaks.push(max_peak.clamp(0.0, 1.0));
+                return (calculated_ticks.max(1), peaks);
+            } else {
+                eprintln!(
+                    "[PLAYLIST ERROR] Datos inválidos: sr={} frames={} bpm={}",
+                    spec.sample_rate, total_frames, bpm
+                );
             }
-
-            return (calculated_ticks, peaks);
+        }
+        Err(err) => {
+            eprintln!("[PLAYLIST ERROR] Hound no pudo abrir {:?}: {}", path, err);
         }
     }
-    
-    (default_ticks, peaks)
+
+    (0, peaks)
 }
 
 pub fn show(
@@ -224,12 +246,15 @@ pub fn show(
     let total_row_step = track_height + row_spacing;
     let header_width = state.header_width;
 
-    // ATAJOS GLOBALES DE SELECCIÓN Y PORTAPAPELES
     let ctrl = ui.input(|i| i.modifiers.ctrl || i.modifiers.command);
     let shift = ui.input(|i| i.modifiers.shift);
 
+    // Helper genérico para convertir ticks a segundos (CORREGIDO)
+    let ticks_to_secs = |ticks: u64| -> f32 {
+        (ticks as f32 / state.ppqn as f32) * (60.0 / bpm as f32)
+    };
+
     if ctrl && ui.input(|i| i.key_pressed(egui::Key::C)) {
-        // COPIAR
         state.clipboard = state.clips.iter()
             .filter(|(_, c)| state.selected_clips.contains(&c.id))
             .cloned()
@@ -237,7 +262,6 @@ pub fn show(
     }
 
     if ctrl && ui.input(|i| i.key_pressed(egui::Key::X)) {
-        // CORTAR
         state.clipboard = state.clips.iter()
             .filter(|(_, c)| state.selected_clips.contains(&c.id))
             .cloned()
@@ -247,7 +271,6 @@ pub fn show(
     }
 
     if ctrl && ui.input(|i| i.key_pressed(egui::Key::V)) {
-        // PEGAR (En la posición del Playhead)
         if !state.clipboard.is_empty() {
             let min_start = state.clipboard.iter().map(|(_, c)| c.start_tick).min().unwrap_or(0);
             let mut new_selection = Vec::new();
@@ -258,12 +281,16 @@ pub fn show(
                 new_clip.id = state.next_clip_id;
                 new_clip.start_tick = state.playhead_tick + offset;
 
-                if let ClipType::Audio { ref sample_path, .. } = new_clip.clip_type {
-                    let seconds_per_tick = 60.0 / (bpm as f32 * state.ppqn as f32);
-                    let position_secs = new_clip.start_tick as f32 * seconds_per_tick;
+                if let ClipType::Audio { ref sample_path, sample_offset_ticks, .. } = new_clip.clip_type {
+                    let position_secs = ticks_to_secs(new_clip.start_tick);
+                    
+                    // Enviamos LoadClip completo de una
                     audio_proxy.send(GuiCommand::LoadClip {
+                        clip_id: new_clip.id,
                         path: sample_path.clone(),
                         position_secs,
+                        duration_secs: ticks_to_secs(new_clip.duration_ticks),
+                        offset_secs: ticks_to_secs(sample_offset_ticks),
                         track_index: track_id,
                     });
                 }
@@ -277,7 +304,6 @@ pub fn show(
     }
 
     if ctrl && ui.input(|i| i.key_pressed(egui::Key::D)) {
-        // DUPLICAR (Pega inmediatamente al final del bloque seleccionado)
         let selected_items: Vec<(usize, PlaylistClip)> = state.clips.iter()
             .filter(|(_, c)| state.selected_clips.contains(&c.id))
             .cloned()
@@ -294,12 +320,15 @@ pub fn show(
                 new_clip.id = state.next_clip_id;
                 new_clip.start_tick = clip.start_tick + duration_block;
 
-                if let ClipType::Audio { ref sample_path, .. } = new_clip.clip_type {
-                    let seconds_per_tick = 60.0 / (bpm as f32 * state.ppqn as f32);
-                    let position_secs = new_clip.start_tick as f32 * seconds_per_tick;
+                if let ClipType::Audio { ref sample_path, sample_offset_ticks, .. } = new_clip.clip_type {
+                    let position_secs = ticks_to_secs(new_clip.start_tick);
+                    
                     audio_proxy.send(GuiCommand::LoadClip {
+                        clip_id: new_clip.id,
                         path: sample_path.clone(),
                         position_secs,
+                        duration_secs: ticks_to_secs(new_clip.duration_ticks),
+                        offset_secs: ticks_to_secs(sample_offset_ticks),
                         track_index: track_id,
                     });
                 }
@@ -313,7 +342,6 @@ pub fn show(
     }
 
     if ui.input(|i| i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace)) {
-        // BORRAR SELECCIÓN
         state.clips.retain(|(_, c)| !state.selected_clips.contains(&c.id));
         state.selected_clips.clear();
     }
@@ -347,8 +375,6 @@ pub fn show(
             .id_source("playlist_main_scroll")
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    
-                    // 1. COLUMNA DE HEADERS
                     ui.vertical(|ui| {
                         ui.set_width(header_width);
 
@@ -440,7 +466,6 @@ pub fn show(
                         }
                     });
 
-                    // RESIZER
                     let total_height = 24.0 + (non_master_count as f32 * total_row_step);
                     let (resizer_rect, resizer_response) = ui.allocate_at_least(
                         Vec2::new(6.0, total_height), 
@@ -469,7 +494,6 @@ pub fn show(
                         );
                     }
 
-                    // 2. TIMELINE CANVAS
                     ScrollArea::horizontal()
                         .id_source("timeline_horizontal_scroll")
                         .show(ui, |ui| {
@@ -484,12 +508,10 @@ pub fn show(
                                 Sense::click_and_drag()
                             );
 
-                            // Limpiar selección al hacer clic sobre canvas vacío
                             if response.clicked_by(PointerButton::Primary) && !shift {
                                 state.selected_clips.clear();
                             }
 
-                            // Zoom con Ctrl + Scroll
                             if response.hovered() {
                                 let ctrl_pressed = ui.input(|i| i.modifiers.ctrl || i.modifiers.command);
                                 if ctrl_pressed {
@@ -512,7 +534,6 @@ pub fn show(
                             let rect = response.rect;
                             painter.rect_filled(rect, 0.0, Color32::from_rgb(16, 16, 20));
 
-                            // RULER & GRID DINÁMICO
                             let ruler_rect = Rect::from_min_size(rect.min, Vec2::new(rect.width(), 24.0));
                             painter.rect_filled(ruler_rect, 0.0, Color32::from_rgb(24, 24, 30));
                             painter.line_segment(
@@ -552,7 +573,6 @@ pub fn show(
                                 }
                             }
 
-                            // RENDER DE PISTAS Y CLIPS
                             let mut current_y = rect.min.y + 24.0;
                             let valid_tracks: Vec<usize> = tracks.iter().filter(|t| !t.is_master).map(|t| t.id).collect();
                             let mut clip_to_delete: Option<usize> = None;
@@ -568,31 +588,156 @@ pub fn show(
                                     Stroke::new(1.0_f32, Color32::from_gray(28))
                                 );
 
+                                // Detección de clips y Trimming limpio
                                 for (clip_track_id, clip) in state.clips.iter_mut() {
                                     if clip_track_id == track_id {
                                         let clip_x = rect.min.x + ticks_to_px(clip.start_tick, zoom_x);
-                                        let clip_w = ticks_to_px(clip.duration_ticks, zoom_x).max(8.0);
+                                        let clip_w = ticks_to_px(clip.duration_ticks, zoom_x).max(12.0);
 
                                         let clip_rect = Rect::from_min_size(
                                             Pos2::new(clip_x, current_y + 1.0), 
                                             Vec2::new(clip_w, track_height - 2.0)
                                         );
 
-                                        // Zonas de Trim (Edges izq y der)
-                                        let trim_handle_w = 6.0_f32;
-                                        let left_trim_rect = Rect::from_min_size(clip_rect.min, Vec2::new(trim_handle_w, clip_rect.height()));
-                                        let right_trim_rect = Rect::from_min_size(
-                                            Pos2::new(clip_rect.max.x - trim_handle_w, clip_rect.min.y), 
-                                            Vec2::new(trim_handle_w, clip_rect.height())
+                                        // Zonas del borde (Trim Handles)
+                                        let handle_w = 6.0_f32;
+                                        let left_handle_rect = Rect::from_min_size(clip_rect.min, Vec2::new(handle_w, clip_rect.height()));
+                                        let right_handle_rect = Rect::from_min_size(
+                                            Pos2::new(clip_rect.max.x - handle_w, clip_rect.min.y), 
+                                            Vec2::new(handle_w, clip_rect.height())
                                         );
 
-                                        let clip_id_egui = ui.make_persistent_id(format!("clip_{}_{}", clip_track_id, clip.id));
-                                        let clip_response = ui.interact(clip_rect, clip_id_egui, Sense::click_and_drag());
+                                        let id_left = ui.make_persistent_id(format!("trim_L_{}_{}", clip_track_id, clip.id));
+                                        let id_right = ui.make_persistent_id(format!("trim_R_{}_{}", clip_track_id, clip.id));
+                                        let id_body = ui.make_persistent_id(format!("clip_body_{}_{}", clip_track_id, clip.id));
+
+                                        let body_rect = Rect::from_min_max(
+                                            Pos2::new(clip_rect.min.x + handle_w, clip_rect.min.y),
+                                            Pos2::new(clip_rect.max.x - handle_w, clip_rect.max.y),
+                                        );
+
+                                        let resp_left = ui.interact(left_handle_rect, id_left, Sense::drag());
+                                        let resp_right = ui.interact(right_handle_rect, id_right, Sense::drag());
+                                        let resp_body = ui.interact(body_rect, id_body, Sense::click_and_drag());
+
+                                        if resp_left.hovered() || resp_right.hovered() || resp_left.dragged() || resp_right.dragged() {
+                                            ui.output_mut(|o| o.cursor_icon = CursorIcon::ResizeHorizontal);
+                                        }
 
                                         let is_selected = state.selected_clips.contains(&clip.id);
 
-                                        // Manejo de Clics para Selección
-                                        if clip_response.clicked_by(PointerButton::Primary) {
+                                        // 1. TRIM IZQUIERDO (Start Trim + Offset)
+                                        if resp_left.dragged() {
+                                            if let Some(mouse_pos) = resp_left.interact_pointer_pos() {
+                                                let mouse_x_rel = (mouse_pos.x - rect.min.x).max(0.0);
+                                                let raw_target_tick = px_to_ticks(mouse_x_rel, zoom_x);
+                                                
+                                                let snapped_target_tick = if snap_step_ticks > 0 {
+                                                    ((raw_target_tick as f64 / snap_step_ticks as f64).round() as u64) * snap_step_ticks
+                                                } else {
+                                                    raw_target_tick
+                                                };
+
+                                                if let ClipType::Audio { ref mut sample_offset_ticks, total_sample_ticks, .. } = clip.clip_type {
+                                                    let current_end_tick = clip.start_tick + clip.duration_ticks;
+                                                    
+                                                    if snapped_target_tick < current_end_tick {
+                                                        let original_start = clip.start_tick.saturating_sub(*sample_offset_ticks);
+                                                        
+                                                        if snapped_target_tick >= original_start {
+                                                            let new_offset = snapped_target_tick - original_start;
+                                                            if new_offset < total_sample_ticks {
+                                                                *sample_offset_ticks = new_offset;
+                                                                clip.start_tick = snapped_target_tick;
+                                                                clip.duration_ticks = current_end_tick - snapped_target_tick;
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        } else if resp_left.drag_stopped() {
+                                            if let ClipType::Audio { sample_offset_ticks, .. } = clip.clip_type {
+                                                audio_proxy.send(GuiCommand::UpdateClipBounds {
+                                                    clip_id: clip.id,
+                                                    position_secs: ticks_to_secs(clip.start_tick),
+                                                    duration_secs: ticks_to_secs(clip.duration_ticks),
+                                                    offset_secs: ticks_to_secs(sample_offset_ticks),
+                                                });
+                                            }
+                                        }
+                                        // 2. TRIM DERECHO (End Trim)
+                                        else if resp_right.dragged() {
+                                            if let Some(mouse_pos) = resp_right.interact_pointer_pos() {
+                                                let mouse_x_rel = (mouse_pos.x - rect.min.x).max(0.0);
+                                                let raw_target_tick = px_to_ticks(mouse_x_rel, zoom_x);
+                                                
+                                                let snapped_target_tick = if snap_step_ticks > 0 {
+                                                    ((raw_target_tick as f64 / snap_step_ticks as f64).round() as u64) * snap_step_ticks
+                                                } else {
+                                                    raw_target_tick
+                                                };
+
+                                                if snapped_target_tick > clip.start_tick {
+                                                    let requested_duration = snapped_target_tick - clip.start_tick;
+
+                                                    if let ClipType::Audio { sample_offset_ticks, total_sample_ticks, .. } = clip.clip_type {
+                                                        let max_available_duration = total_sample_ticks.saturating_sub(sample_offset_ticks);
+                                                        let new_duration = requested_duration.min(max_available_duration).max(1);
+                                                        clip.duration_ticks = new_duration;
+                                                    }
+                                                }
+                                            }
+                                        } else if resp_right.drag_stopped() {
+                                            if let ClipType::Audio { sample_offset_ticks, .. } = clip.clip_type {
+                                                audio_proxy.send(GuiCommand::UpdateClipBounds {
+                                                    clip_id: clip.id,
+                                                    position_secs: ticks_to_secs(clip.start_tick),
+                                                    duration_secs: ticks_to_secs(clip.duration_ticks),
+                                                    offset_secs: ticks_to_secs(sample_offset_ticks),
+                                                });
+                                            }
+                                        }
+                                        // 3. MOVER CLIP ENTERO
+                                        else if resp_body.dragged() {
+                                            if resp_body.drag_started_by(PointerButton::Primary) {
+                                                if let Some(mouse_pos) = resp_body.interact_pointer_pos() {
+                                                    let grab_offset = (mouse_pos.x - clip_rect.min.x).max(0.0);
+                                                    ui.data_mut(|d| d.insert_temp(id_body, grab_offset));
+                                                }
+                                            }
+
+                                            if let Some(mouse_pos) = resp_body.interact_pointer_pos() {
+                                                let grab_offset_x: f32 = ui.data(|d| d.get_temp(id_body)).unwrap_or(0.0);
+                                                let mouse_x_relative = (mouse_pos.x - rect.min.x - grab_offset_x).max(0.0);
+                                                let raw_tick = px_to_ticks(mouse_x_relative, zoom_x);
+
+                                                clip.start_tick = if snap_step_ticks > 0 {
+                                                    ((raw_tick as f64 / snap_step_ticks as f64).round() as u64) * snap_step_ticks
+                                                } else {
+                                                    raw_tick
+                                                };
+
+                                                let rel_y = mouse_pos.y - (rect.min.y + 24.0);
+                                                if rel_y >= 0.0 {
+                                                    let target_idx = (rel_y / total_row_step).floor() as usize;
+                                                    if target_idx < valid_tracks.len() {
+                                                        *clip_track_id = valid_tracks[target_idx];
+                                                    }
+                                                }
+                                            }
+                                        } else if resp_body.drag_stopped() {
+                                            if let ClipType::Audio { sample_offset_ticks, .. } = clip.clip_type {
+                                                audio_proxy.send(GuiCommand::UpdateClipBounds {
+                                                    clip_id: clip.id,
+                                                    position_secs: ticks_to_secs(clip.start_tick),
+                                                    duration_secs: ticks_to_secs(clip.duration_ticks),
+                                                    offset_secs: ticks_to_secs(sample_offset_ticks),
+                                                });
+                                            }
+                                        }
+
+                                        // Selección & Delete
+                                        if resp_body.clicked_by(PointerButton::Primary) {
                                             if shift {
                                                 if is_selected {
                                                     state.selected_clips.retain(|&id| id != clip.id);
@@ -600,82 +745,19 @@ pub fn show(
                                                     state.selected_clips.push(clip.id);
                                                 }
                                             } else {
-                                                if !is_selected {
-                                                    state.selected_clips = vec![clip.id];
-                                                }
+                                                state.selected_clips = vec![clip.id];
                                             }
                                         }
 
-                                        // Click Derecho para eliminar
-                                        if clip_response.secondary_clicked() {
+                                        if resp_body.secondary_clicked() {
                                             clip_to_delete = Some(clip.id);
                                         }
 
-                                        // LÓGICA DE DRAG / TRIM / SLIP
-                                        if let Some(mouse_pos) = clip_response.interact_pointer_pos() {
-                                            if left_trim_rect.contains(mouse_pos) || right_trim_rect.contains(mouse_pos) {
-                                                ui.output_mut(|o| o.cursor_icon = CursorIcon::ResizeHorizontal);
-                                            } else if clip_response.dragged() {
-                                                ui.output_mut(|o| o.cursor_icon = CursorIcon::Grabbing);
-                                            } else if clip_response.hovered() {
-                                                ui.output_mut(|o| o.cursor_icon = CursorIcon::Grab);
-                                            }
-
-                                            if clip_response.dragged() {
-                                                if clip_response.drag_started_by(PointerButton::Primary) {
-                                                    let grab_offset = (mouse_pos.x - clip_rect.min.x).max(0.0);
-                                                    ui.data_mut(|d| d.insert_temp(clip_id_egui, grab_offset));
-                                                }
-
-                                                let grab_offset_x: f32 = ui.data(|d| d.get_temp(clip_id_egui)).unwrap_or(0.0);
-
-                                                // Si arrastra el borde derecho (Trim End)
-                                                if right_trim_rect.contains(mouse_pos) || ui.data(|d| d.get_temp(ui.make_persistent_id("trim_end")).unwrap_or(false)) {
-                                                    ui.data_mut(|d| d.insert_temp(ui.make_persistent_id("trim_end"), true));
-                                                    let new_end_px = (mouse_pos.x - rect.min.x).max(clip_x + step_width);
-                                                    let new_end_tick = px_to_ticks(new_end_px, zoom_x);
-                                                    
-                                                    let snapped_end = if snap_step_ticks > 0 {
-                                                        ((new_end_tick as f64 / snap_step_ticks as f64).round() as u64) * snap_step_ticks
-                                                    } else {
-                                                        new_end_tick
-                                                    };
-
-                                                    if snapped_end > clip.start_tick {
-                                                        clip.duration_ticks = snapped_end - clip.start_tick;
-                                                    }
-                                                } 
-                                                // Mover clip entero
-                                                else {
-                                                    let mouse_x_relative = (mouse_pos.x - rect.min.x - grab_offset_x).max(0.0);
-                                                    let raw_tick = px_to_ticks(mouse_x_relative, zoom_x);
-
-                                                    clip.start_tick = if snap_step_ticks > 0 {
-                                                        ((raw_tick as f64 / snap_step_ticks as f64).round() as u64) * snap_step_ticks
-                                                    } else {
-                                                        raw_tick
-                                                    };
-
-                                                    let rel_y = mouse_pos.y - (rect.min.y + 24.0);
-                                                    if rel_y >= 0.0 {
-                                                        let target_idx = (rel_y / total_row_step).floor() as usize;
-                                                        if target_idx < valid_tracks.len() {
-                                                            *clip_track_id = valid_tracks[target_idx];
-                                                        }
-                                                    }
-                                                }
-                                            } else {
-                                                ui.data_mut(|d| d.insert_temp(ui.make_persistent_id("trim_end"), false));
-                                            }
-                                        }
-
-                                        // RENDER Y RESALTADO DE BORDES
+                                        // Dibujado del Clip
                                         let (border_color, border_width) = if is_selected {
-                                            (Color32::from_rgb(255, 200, 0), 2.0_f32) // Amarillo brillante para seleccionados
-                                        } else if clip_response.dragged() {
+                                            (Color32::from_rgb(255, 200, 0), 2.0_f32)
+                                        } else if resp_body.dragged() || resp_left.dragged() || resp_right.dragged() {
                                             (Color32::from_rgb(0, 255, 255), 2.0_f32)
-                                        } else if clip_response.hovered() {
-                                            (Color32::WHITE, 1.5_f32)
                                         } else {
                                             (Color32::from_white_alpha(100), 1.0_f32)
                                         };
@@ -683,40 +765,52 @@ pub fn show(
                                         painter.rect_filled(clip_rect, 2.0, clip.color);
                                         painter.rect_stroke(clip_rect, 2.0, Stroke::new(border_width, border_color));
 
-                                        // WAVEFORM RENDERER
-                                        if let ClipType::Audio { peaks, .. } = &clip.clip_type {
-                                            if !peaks.is_empty() {
+                                        if resp_left.hovered() || resp_left.dragged() {
+                                            painter.rect_filled(left_handle_rect, 0.0, Color32::from_white_alpha(80));
+                                        }
+                                        if resp_right.hovered() || resp_right.dragged() {
+                                            painter.rect_filled(right_handle_rect, 0.0, Color32::from_white_alpha(80));
+                                        }
+
+                                        // Waveform
+                                        if let ClipType::Audio { peaks, sample_offset_ticks, total_sample_ticks, .. } = &clip.clip_type {
+                                            if !peaks.is_empty() && *total_sample_ticks > 0 {
                                                 let inner_rect = clip_rect.shrink2(Vec2::new(2.0, 4.0));
                                                 let center_y = inner_rect.center().y;
                                                 let wave_color = Color32::from_rgba_unmultiplied(255, 255, 255, 180);
 
                                                 let step_x = 2.0_f32;
-                                                let max_bars = (inner_rect.width() / step_x) as usize;
+                                                let total_render_steps = (inner_rect.width() / step_x) as usize;
 
-                                                for i in 0..max_bars {
+                                                let start_ratio = *sample_offset_ticks as f32 / *total_sample_ticks as f32;
+                                                let duration_ratio = clip.duration_ticks as f32 / *total_sample_ticks as f32;
+
+                                                for i in 0..total_render_steps {
                                                     let x = inner_rect.min.x + (i as f32 * step_x);
                                                     if x >= inner_rect.max.x { break; }
 
-                                                    let peak_idx = ((i as f32 / max_bars as f32) * peaks.len() as f32) as usize;
-                                                    let peak_val = peaks.get(peak_idx).cloned().unwrap_or(0.0);
+                                                    let local_norm = i as f32 / total_render_steps as f32;
+                                                    let sample_norm = start_ratio + (local_norm * duration_ratio);
 
-                                                    let bar_height = (inner_rect.height() * 0.8) * peak_val;
-                                                    if bar_height > 0.5 {
-                                                        painter.line_segment(
-                                                            [
-                                                                Pos2::new(x, center_y - bar_height * 0.5),
-                                                                Pos2::new(x, center_y + bar_height * 0.5),
-                                                            ],
-                                                            Stroke::new(1.0, wave_color),
-                                                        );
+                                                    let peak_idx = (sample_norm * peaks.len() as f32) as usize;
+                                                    if let Some(&peak_val) = peaks.get(peak_idx) {
+                                                        let bar_height = (inner_rect.height() * 0.8) * peak_val;
+                                                        if bar_height > 0.5 {
+                                                            painter.line_segment(
+                                                                [
+                                                                    Pos2::new(x, center_y - bar_height * 0.5),
+                                                                    Pos2::new(x, center_y + bar_height * 0.5),
+                                                                ],
+                                                                Stroke::new(1.0, wave_color),
+                                                            );
+                                                        }
                                                     }
                                                 }
                                             }
                                         }
 
-                                        // Header / Clip Title
                                         painter.text(
-                                            clip_rect.min + Vec2::new(4.0, 2.0),
+                                            clip_rect.min + Vec2::new(8.0, 2.0),
                                             Align2::LEFT_TOP,
                                             &clip.name,
                                             egui::FontId::proportional(10.0),
@@ -728,19 +822,16 @@ pub fn show(
                                 current_y += total_row_step;
                             }
 
-                            // Borrar clip si se hizo click derecho
                             if let Some(id_del) = clip_to_delete {
                                 state.clips.retain(|(_, c)| c.id != id_del);
                             }
 
-                            // PLAYHEAD (Sincronización por Ticks)
                             let playhead_x = rect.min.x + ticks_to_px(state.playhead_tick, zoom_x);
                             painter.line_segment(
                                 [Pos2::new(playhead_x, rect.min.y), Pos2::new(playhead_x, rect.max.y)],
                                 Stroke::new(2.0_f32, Color32::from_rgb(0, 255, 255))
                             );
 
-                            // Mover Playhead al hacer clic en el Ruler / Canvas
                             if response.dragged() || response.clicked() {
                                 if let Some(pointer_pos) = response.interact_pointer_pos() {
                                     let rel_x = (pointer_pos.x - rect.min.x).max(0.0);
@@ -752,7 +843,7 @@ pub fn show(
                                 }
                             }
                             
-                            // DROP DE ARCHIVOS AUDIO
+                            // DROP DE SAMPLES DESDE EL EXPLORADOR
                             if let Some(path) = dragged_sample.clone() {
                                 if ui.input(|i| i.pointer.any_released() || i.pointer.primary_released()) {
                                     if let Some(drop_pos) = ui.input(|i| i.pointer.hover_pos()) {
@@ -777,6 +868,7 @@ pub fn show(
                                                     let sample_path_str = path.to_string_lossy().to_string();
                                                     
                                                     let (duration_ticks, peaks) = load_sample_info(&path, state.ppqn, bpm);
+                                                    eprintln!("[PLAYLIST DEBUG] state.ppqn={} bpm={} -> duration_ticks={}", state.ppqn, bpm, duration_ticks);
 
                                                     let clip = PlaylistClip {
                                                         id: state.next_clip_id,
@@ -787,19 +879,25 @@ pub fn show(
                                                             sample_path: sample_path_str.clone(),
                                                             peaks,
                                                             sample_offset_ticks: 0,
+                                                            total_sample_ticks: duration_ticks,
                                                         },
                                                         color: Color32::from_rgb(32, 95, 145),
                                                     };
 
+                                                    let created_clip_id = state.next_clip_id;
                                                     state.next_clip_id += 1;
                                                     state.clips.push((target_track_id, clip));
 
-                                                    let seconds_per_tick = 60.0 / (bpm as f32 * state.ppqn as f32);
-                                                    let position_secs = drop_tick as f32 * seconds_per_tick;
+                                                    let position_secs = ticks_to_secs(drop_tick);
+                                                    let duration_secs = ticks_to_secs(duration_ticks);
 
+                                                    // Se manda UN solo comando directo al audio engine
                                                     audio_proxy.send(GuiCommand::LoadClip {
+                                                        clip_id: created_clip_id,
                                                         path: sample_path_str,
                                                         position_secs,
+                                                        duration_secs,
+                                                        offset_secs: 0.0,
                                                         track_index: target_track_id,
                                                     });
                                                 }
