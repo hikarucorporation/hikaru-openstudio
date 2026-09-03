@@ -10,6 +10,7 @@ use crate::views::open_wavetable::{WavetableOscillator, ModulatorNode};
 
 // --- DATA STRUCTURES ---
 
+#[derive(Clone, Debug)] // <--- AGREGAR AQUÍ
 pub struct DspSlot {
     pub id: usize,
     pub name: String,
@@ -40,11 +41,13 @@ impl DspSlot {
     }
 }
 
+#[derive(Clone, Debug)] // <--- AGREGAR AQUÍ
 pub struct SendConnection {
     pub target_id: usize,
     pub amount: f32, 
 }
 
+#[derive(Clone, Debug)]
 pub struct Track {
     pub id: usize, 
     pub name: String,

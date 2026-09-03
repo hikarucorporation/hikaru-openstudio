@@ -32,7 +32,7 @@ pub enum PanMode {
 pub struct HikaruApp {
     pub mode: AppMode,
     pub transport: TransportPosition,
-    pub position_clock: Arc<AtomicU64>, // <--- NUEVO
+    pub position_clock: Arc<AtomicU64>,
     pub is_looping: bool,
     pub cpu_usage: f32,
     pub show_mixer: bool,
@@ -44,6 +44,7 @@ pub struct HikaruApp {
 
     pub audio_settings_state: audio_settings::AudioSettingsState,
     pub playlist_state: playlist::PlaylistState,
+    pub matrix_state: matrix::SessionMatrixState,
     pub dragged_sample: Option<PathBuf>,
 
     pub live_tracks: Vec<mixer::Track>,
@@ -62,7 +63,7 @@ impl HikaruApp {
         _cc: &eframe::CreationContext<'_>,
         audio_proxy: AudioProxy,
         audio_stream: Option<cpal::Stream>,
-        position_clock: Arc<AtomicU64>, // <--- Pasar desde main.rs si ya lo instanciás allá
+        position_clock: Arc<AtomicU64>,
     ) -> Self {
         let sample_rate = SampleRate::new(44100.0);
         let transport = TransportPosition::new(sample_rate, 140.0);
@@ -87,7 +88,7 @@ impl HikaruApp {
         Self {
             mode: AppMode::OpenLive,
             transport,
-            position_clock, // <--- GUARDAMOS LA REFERENCIA
+            position_clock,
             is_looping: false,
             cpu_usage: 0.12,
             show_mixer: false,
@@ -103,6 +104,7 @@ impl HikaruApp {
             is_recording: false,
 
             playlist_state: playlist::PlaylistState::default(),
+            matrix_state: matrix::SessionMatrixState::default(),
 
             live_tracks,
             studio_tracks,
@@ -178,7 +180,7 @@ impl eframe::App for HikaruApp {
                     header::show(
                         ui,
                         &mut self.transport,
-                        &self.position_clock, // <--- ¡Ahora sí existe en self!
+                        &self.position_clock,
                         &mut self.is_looping,
                         &mut self.is_recording,
                         &mut self.mode,
@@ -198,9 +200,30 @@ impl eframe::App for HikaruApp {
         CentralPanel::default().show(ctx, |ui| {
             match self.mode {
                 AppMode::OpenLive => {
-                    matrix::show(ui, self.transport.playback_state == TransportPlaybackState::Playing);
+                    let ppqn = 960u64;
+                    let sample_rate = self.transport.sample_rate.get() as f64;
+                    let current_tick = if sample_rate > 0.0 {
+                        let seconds_per_beat = 60.0 / self.transport.bpm;
+                        let seconds_per_tick = seconds_per_beat / ppqn as f64;
+                        let current_seconds = self.transport.sample_count as f64 / sample_rate;
+                        (current_seconds / seconds_per_tick) as u64
+                    } else {
+                        0
+                    };
+
+                    matrix::show(
+                        ui,
+                        &mut self.matrix_state,
+                        &mut self.dragged_sample,
+                        &self.audio_proxy,
+                        current_tick,
+                        ppqn,
+                        self.transport.bpm,          // <--- Arg 7: f64
+                        self.transport.sample_rate.get() as u32, // <--- O .to_u32() / .0 dependiendo del enum
+                    );
                 }
                 AppMode::OpenStudio => {
+                    // ...
                     let mut current_bar = self.current_bar();
                     playlist::show(
                         ui,

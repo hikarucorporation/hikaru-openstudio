@@ -12,6 +12,44 @@ use std::path::PathBuf;
 use crate::views::mixer::Track;
 use crate::audio_proxy::{AudioProxy, GuiCommand};
 
+/// Modo de renderizado del carril de Playlist.
+/// - `Arranger`: vista principal (Timeline global), manda comandos reales
+///   al `hikaru_audio_engine` (Seek, LoadClip, UpdateClipBounds) y permite
+///   agregar/quitar pistas.
+/// - `ClipEditor`: instancia embebida dentro de `matrix.rs` (Session Matrix
+///   Clip Editor). Usa la MISMA lógica visual y de edición (grilla, waveform,
+///   trim, slice, drag&drop) pero:
+///     * No dispara `Seek` global (el "playhead" es local al contenedor).
+///     * No manda `LoadClip`/`UpdateClipBounds` al motor todavía: la
+///       reproducción real de sub-clips dentro de un `MatrixClip` es
+///       responsabilidad de `hikaru_sequencer` (FASE 4, ver ORDEN-DESARROLLO.md)
+///       y aún no está implementada en el motor. Queda marcado con TODO.
+///     * Oculta los botones [+]/[-] de pistas (el contenedor es de 1 sola pista).
+#[derive(Clone, Copy)]
+pub enum ViewMode<'a> {
+    Arranger,
+    ClipEditor { title: &'a str },
+}
+
+impl<'a> ViewMode<'a> {
+    #[inline]
+    fn drives_engine(&self) -> bool {
+        matches!(self, ViewMode::Arranger)
+    }
+
+    #[inline]
+    fn allows_track_add_remove(&self) -> bool {
+        matches!(self, ViewMode::Arranger)
+    }
+
+    fn header_label(&self) -> String {
+        match self {
+            ViewMode::Arranger => "PLAYLIST / ARRANGEMENT".to_string(),
+            ViewMode::ClipEditor { title } => title.to_string(),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct CurvePoint {
     pub rel_tick: u64,
@@ -44,6 +82,7 @@ pub struct PlaylistClip {
     pub color: Color32,
 }
 
+#[derive(Clone, Debug)]
 pub struct PlaylistState {
     pub clips: Vec<(usize, PlaylistClip)>,
     pub playhead_tick: u64,
@@ -224,15 +263,87 @@ fn load_sample_info(path: &PathBuf, ppqn: u64, bpm: f64) -> (u64, Vec<f32>) {
     (0, peaks)
 }
 
+/// Construye un `PlaylistClip` de tipo `Audio` a partir de un sample en disco.
+/// Centraliza la lectura de `hound` + generación de peaks para que tanto el
+/// Arranger como el Clip Editor de la Session Matrix (`matrix.rs`) creen
+/// clips 100% compatibles entre sí (mismo `ClipType::Audio`).
+pub fn build_audio_clip(
+    id: usize,
+    name: String,
+    path: &PathBuf,
+    start_tick: u64,
+    ppqn: u64,
+    bpm: f64,
+    color: Color32,
+) -> PlaylistClip {
+    let (duration_ticks, peaks) = load_sample_info(path, ppqn, bpm);
+    let duration_ticks = duration_ticks.max(1);
+
+    PlaylistClip {
+        id,
+        name,
+        start_tick,
+        duration_ticks,
+        clip_type: ClipType::Audio {
+            sample_path: path.to_string_lossy().to_string(),
+            peaks,
+            sample_offset_ticks: 0,
+            total_sample_ticks: duration_ticks,
+        },
+        color,
+    }
+}
+
+/// Vista principal del Arranger (Timeline global). Manda comandos reales
+/// al `hikaru_audio_engine`.
 pub fn show(
-    ui: &mut Ui, 
-    state: &mut PlaylistState, 
-    tracks: &mut Vec<Track>, 
+    ui: &mut Ui,
+    state: &mut PlaylistState,
+    tracks: &mut Vec<Track>,
     current_bar: &mut f32,
     dragged_sample: &mut Option<PathBuf>,
     audio_proxy: &AudioProxy,
     bpm: f64,
     sample_rate: u32,
+) {
+    show_impl(
+        ui, state, tracks, current_bar, dragged_sample, audio_proxy, bpm, sample_rate,
+        ViewMode::Arranger,
+    );
+}
+
+/// Vista embebida usada por `matrix.rs` dentro del Clip Editor de la Session
+/// Matrix. Reutiliza exactamente el mismo carril (header + grilla + waveform
+/// + trim + slice + drag&drop) que el Arranger, pero acotado a la(s)
+/// pista(s) locales del `MatrixClip` seleccionado y sin tocar el transporte
+/// global ni el motor de audio real (ver `ViewMode::ClipEditor`).
+pub fn show_embedded(
+    ui: &mut Ui,
+    state: &mut PlaylistState,
+    tracks: &mut Vec<Track>,
+    local_bar: &mut f32,
+    dragged_sample: &mut Option<PathBuf>,
+    audio_proxy: &AudioProxy,
+    bpm: f64,
+    sample_rate: u32,
+    title: &str,
+) {
+    show_impl(
+        ui, state, tracks, local_bar, dragged_sample, audio_proxy, bpm, sample_rate,
+        ViewMode::ClipEditor { title },
+    );
+}
+
+fn show_impl(
+    ui: &mut Ui,
+    state: &mut PlaylistState,
+    tracks: &mut Vec<Track>,
+    current_bar: &mut f32,
+    dragged_sample: &mut Option<PathBuf>,
+    audio_proxy: &AudioProxy,
+    bpm: f64,
+    sample_rate: u32,
+    mode: ViewMode,
 ) {
     let ticks_per_bar = state.ppqn * 4;
     state.playhead_tick = ((*current_bar - 1.0).max(0.0) * ticks_per_bar as f32) as u64;
@@ -281,18 +392,20 @@ pub fn show(
                 new_clip.id = state.next_clip_id;
                 new_clip.start_tick = state.playhead_tick + offset;
 
-                if let ClipType::Audio { ref sample_path, sample_offset_ticks, .. } = new_clip.clip_type {
-                    let position_secs = ticks_to_secs(new_clip.start_tick);
-                    
-                    // Enviamos LoadClip completo de una
-                    audio_proxy.send(GuiCommand::LoadClip {
-                        clip_id: new_clip.id,
-                        path: sample_path.clone(),
-                        position_secs,
-                        duration_secs: ticks_to_secs(new_clip.duration_ticks),
-                        offset_secs: ticks_to_secs(sample_offset_ticks),
-                        track_index: track_id,
-                    });
+                if mode.drives_engine() {
+                    if let ClipType::Audio { ref sample_path, sample_offset_ticks, .. } = new_clip.clip_type {
+                        let position_secs = ticks_to_secs(new_clip.start_tick);
+
+                        // Enviamos LoadClip completo de una
+                        audio_proxy.send(GuiCommand::LoadClip {
+                            clip_id: new_clip.id,
+                            path: sample_path.clone(),
+                            position_secs,
+                            duration_secs: ticks_to_secs(new_clip.duration_ticks),
+                            offset_secs: ticks_to_secs(sample_offset_ticks),
+                            track_index: track_id,
+                        });
+                    }
                 }
 
                 new_selection.push(new_clip.id);
@@ -320,17 +433,19 @@ pub fn show(
                 new_clip.id = state.next_clip_id;
                 new_clip.start_tick = clip.start_tick + duration_block;
 
-                if let ClipType::Audio { ref sample_path, sample_offset_ticks, .. } = new_clip.clip_type {
-                    let position_secs = ticks_to_secs(new_clip.start_tick);
-                    
-                    audio_proxy.send(GuiCommand::LoadClip {
-                        clip_id: new_clip.id,
-                        path: sample_path.clone(),
-                        position_secs,
-                        duration_secs: ticks_to_secs(new_clip.duration_ticks),
-                        offset_secs: ticks_to_secs(sample_offset_ticks),
-                        track_index: track_id,
-                    });
+                if mode.drives_engine() {
+                    if let ClipType::Audio { ref sample_path, sample_offset_ticks, .. } = new_clip.clip_type {
+                        let position_secs = ticks_to_secs(new_clip.start_tick);
+
+                        audio_proxy.send(GuiCommand::LoadClip {
+                            clip_id: new_clip.id,
+                            path: sample_path.clone(),
+                            position_secs,
+                            duration_secs: ticks_to_secs(new_clip.duration_ticks),
+                            offset_secs: ticks_to_secs(sample_offset_ticks),
+                            track_index: track_id,
+                        });
+                    }
                 }
 
                 new_selection.push(new_clip.id);
@@ -350,7 +465,7 @@ pub fn show(
         let non_master_count = tracks.iter().filter(|t| !t.is_master).count();
 
         ui.horizontal(|ui| {
-            ui.label(RichText::new("PLAYLIST / ARRANGEMENT").strong().color(Color32::from_rgb(0, 255, 255)));
+            ui.label(RichText::new(mode.header_label()).strong().color(Color32::from_rgb(0, 255, 255)));
             ui.separator();
             
             ui.label(RichText::new("Grid:").size(11.0).color(Color32::from_gray(180)));
@@ -383,21 +498,23 @@ pub fn show(
                             egui::Layout::left_to_right(egui::Align::Center),
                             |ui| {
                                 ui.label(RichText::new("TRACKS").size(10.0).strong().color(Color32::from_gray(140)));
-                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    if ui.button(RichText::new("[ - ]").strong().color(Color32::from_gray(160))).clicked() {
-                                        if non_master_count > 1 {
-                                            if let Some(pos) = tracks.iter().rposition(|t| !t.is_master) {
-                                                tracks.remove(pos);
+                                if mode.allows_track_add_remove() {
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        if ui.button(RichText::new("[ - ]").strong().color(Color32::from_gray(160))).clicked() {
+                                            if non_master_count > 1 {
+                                                if let Some(pos) = tracks.iter().rposition(|t| !t.is_master) {
+                                                    tracks.remove(pos);
+                                                }
                                             }
                                         }
-                                    }
-                                    if ui.button(RichText::new("[ + ]").strong().color(Color32::from_rgb(255, 140, 0))).clicked() {
-                                        let next_id = tracks.iter().map(|t| t.id).max().unwrap_or(0) + 1;
-                                        let track_num = non_master_count + 1;
-                                        let new_track = Track::new(next_id, format!("TRACK {:02}", track_num), false);
-                                        tracks.push(new_track);
-                                    }
-                                });
+                                        if ui.button(RichText::new("[ + ]").strong().color(Color32::from_rgb(255, 140, 0))).clicked() {
+                                            let next_id = tracks.iter().map(|t| t.id).max().unwrap_or(0) + 1;
+                                            let track_num = non_master_count + 1;
+                                            let new_track = Track::new(next_id, format!("TRACK {:02}", track_num), false);
+                                            tracks.push(new_track);
+                                        }
+                                    });
+                                }
                             }
                         );
 
@@ -490,7 +607,7 @@ pub fn show(
                         };
                         ui.painter().line_segment(
                             [Pos2::new(line_x, resizer_rect.min.y), Pos2::new(line_x, resizer_rect.max.y)],
-                            Stroke::new(2.0, line_color)
+                            Stroke::new(2.0_f32, line_color)
                         );
                     }
 
@@ -533,6 +650,14 @@ pub fn show(
 
                             let rect = response.rect;
                             painter.rect_filled(rect, 0.0, Color32::from_rgb(16, 16, 20));
+
+                            // Herramienta de corte (Slice, tecla 'S'). Compartida entre el Arranger
+                            // y el Clip Editor embebido de la Session Matrix: parte un clip de Audio
+                            // en dos en la posición del cursor, respetando sample_offset_ticks.
+                            let slice_key_pressed = ui.input(|i| i.key_pressed(egui::Key::S));
+                            let slice_hover_pos = response.interact_pointer_pos()
+                                .or_else(|| ui.input(|i| i.pointer.hover_pos()));
+                            let mut pending_slices: Vec<(usize, PlaylistClip)> = Vec::new();
 
                             let ruler_rect = Rect::from_min_size(rect.min, Vec2::new(rect.width(), 24.0));
                             painter.rect_filled(ruler_rect, 0.0, Color32::from_rgb(24, 24, 30));
@@ -626,6 +751,49 @@ pub fn show(
 
                                         let is_selected = state.selected_clips.contains(&clip.id);
 
+                                        // SLICE ('S'): corta el clip en dos en la posición del cursor.
+                                        if slice_key_pressed {
+                                            if let Some(pos) = slice_hover_pos {
+                                                if clip_rect.contains(pos) {
+                                                    let rel_x = (pos.x - rect.min.x).max(0.0);
+                                                    let raw_slice_tick = px_to_ticks(rel_x, zoom_x);
+                                                    let slice_tick = if snap_step_ticks > 0 {
+                                                        ((raw_slice_tick as f64 / snap_step_ticks as f64).round() as u64) * snap_step_ticks
+                                                    } else {
+                                                        raw_slice_tick
+                                                    };
+
+                                                    let clip_end_tick = clip.start_tick + clip.duration_ticks;
+
+                                                    if slice_tick > clip.start_tick && slice_tick < clip_end_tick {
+                                                        if let ClipType::Audio { ref sample_path, ref peaks, sample_offset_ticks, total_sample_ticks } = clip.clip_type {
+                                                            let left_duration = slice_tick - clip.start_tick;
+                                                            let right_offset = sample_offset_ticks + left_duration;
+                                                            let right_duration = clip_end_tick - slice_tick;
+
+                                                            let right_clip = PlaylistClip {
+                                                                id: state.next_clip_id,
+                                                                name: format!("{} (Slice)", clip.name),
+                                                                start_tick: slice_tick,
+                                                                duration_ticks: right_duration,
+                                                                clip_type: ClipType::Audio {
+                                                                    sample_path: sample_path.clone(),
+                                                                    peaks: peaks.clone(),
+                                                                    sample_offset_ticks: right_offset,
+                                                                    total_sample_ticks,
+                                                                },
+                                                                color: clip.color,
+                                                            };
+
+                                                            pending_slices.push((*clip_track_id, right_clip));
+                                                            state.next_clip_id += 1;
+                                                            clip.duration_ticks = left_duration;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+
                                         // 1. TRIM IZQUIERDO (Start Trim + Offset)
                                         if resp_left.dragged() {
                                             if let Some(mouse_pos) = resp_left.interact_pointer_pos() {
@@ -656,13 +824,15 @@ pub fn show(
                                                 }
                                             }
                                         } else if resp_left.drag_stopped() {
-                                            if let ClipType::Audio { sample_offset_ticks, .. } = clip.clip_type {
-                                                audio_proxy.send(GuiCommand::UpdateClipBounds {
-                                                    clip_id: clip.id,
-                                                    position_secs: ticks_to_secs(clip.start_tick),
-                                                    duration_secs: ticks_to_secs(clip.duration_ticks),
-                                                    offset_secs: ticks_to_secs(sample_offset_ticks),
-                                                });
+                                            if mode.drives_engine() {
+                                                if let ClipType::Audio { sample_offset_ticks, .. } = clip.clip_type {
+                                                    audio_proxy.send(GuiCommand::UpdateClipBounds {
+                                                        clip_id: clip.id,
+                                                        position_secs: ticks_to_secs(clip.start_tick),
+                                                        duration_secs: ticks_to_secs(clip.duration_ticks),
+                                                        offset_secs: ticks_to_secs(sample_offset_ticks),
+                                                    });
+                                                }
                                             }
                                         }
                                         // 2. TRIM DERECHO (End Trim)
@@ -688,13 +858,15 @@ pub fn show(
                                                 }
                                             }
                                         } else if resp_right.drag_stopped() {
-                                            if let ClipType::Audio { sample_offset_ticks, .. } = clip.clip_type {
-                                                audio_proxy.send(GuiCommand::UpdateClipBounds {
-                                                    clip_id: clip.id,
-                                                    position_secs: ticks_to_secs(clip.start_tick),
-                                                    duration_secs: ticks_to_secs(clip.duration_ticks),
-                                                    offset_secs: ticks_to_secs(sample_offset_ticks),
-                                                });
+                                            if mode.drives_engine() {
+                                                if let ClipType::Audio { sample_offset_ticks, .. } = clip.clip_type {
+                                                    audio_proxy.send(GuiCommand::UpdateClipBounds {
+                                                        clip_id: clip.id,
+                                                        position_secs: ticks_to_secs(clip.start_tick),
+                                                        duration_secs: ticks_to_secs(clip.duration_ticks),
+                                                        offset_secs: ticks_to_secs(sample_offset_ticks),
+                                                    });
+                                                }
                                             }
                                         }
                                         // 3. MOVER CLIP ENTERO
@@ -726,13 +898,15 @@ pub fn show(
                                                 }
                                             }
                                         } else if resp_body.drag_stopped() {
-                                            if let ClipType::Audio { sample_offset_ticks, .. } = clip.clip_type {
-                                                audio_proxy.send(GuiCommand::UpdateClipBounds {
-                                                    clip_id: clip.id,
-                                                    position_secs: ticks_to_secs(clip.start_tick),
-                                                    duration_secs: ticks_to_secs(clip.duration_ticks),
-                                                    offset_secs: ticks_to_secs(sample_offset_ticks),
-                                                });
+                                            if mode.drives_engine() {
+                                                if let ClipType::Audio { sample_offset_ticks, .. } = clip.clip_type {
+                                                    audio_proxy.send(GuiCommand::UpdateClipBounds {
+                                                        clip_id: clip.id,
+                                                        position_secs: ticks_to_secs(clip.start_tick),
+                                                        duration_secs: ticks_to_secs(clip.duration_ticks),
+                                                        offset_secs: ticks_to_secs(sample_offset_ticks),
+                                                    });
+                                                }
                                             }
                                         }
 
@@ -801,7 +975,7 @@ pub fn show(
                                                                     Pos2::new(x, center_y - bar_height * 0.5),
                                                                     Pos2::new(x, center_y + bar_height * 0.5),
                                                                 ],
-                                                                Stroke::new(1.0, wave_color),
+                                                                Stroke::new(1.0_f32, wave_color),
                                                             );
                                                         }
                                                     }
@@ -826,6 +1000,10 @@ pub fn show(
                                 state.clips.retain(|(_, c)| c.id != id_del);
                             }
 
+                            if !pending_slices.is_empty() {
+                                state.clips.extend(pending_slices);
+                            }
+
                             let playhead_x = rect.min.x + ticks_to_px(state.playhead_tick, zoom_x);
                             painter.line_segment(
                                 [Pos2::new(playhead_x, rect.min.y), Pos2::new(playhead_x, rect.max.y)],
@@ -837,9 +1015,14 @@ pub fn show(
                                     let rel_x = (pointer_pos.x - rect.min.x).max(0.0);
                                     let clicked_ticks = px_to_ticks(rel_x, zoom_x);
                                     *current_bar = (clicked_ticks as f32 / ticks_per_bar as f32) + 1.0;
-                                    
-                                    let target_samples = ((*current_bar - 1.0) as f64 * samples_per_bar) as u64;
-                                    audio_proxy.send(GuiCommand::Seek { sample_count: target_samples });
+
+                                    if mode.drives_engine() {
+                                        let target_samples = ((*current_bar - 1.0) as f64 * samples_per_bar) as u64;
+                                        audio_proxy.send(GuiCommand::Seek { sample_count: target_samples });
+                                    }
+                                    // En ViewMode::ClipEditor el "playhead" es local al MatrixClip
+                                    // (posición dentro del contenedor); no debe mover el transporte
+                                    // global. La audición in-place queda pendiente de hikaru_sequencer.
                                 }
                             }
                             
@@ -888,18 +1071,24 @@ pub fn show(
                                                     state.next_clip_id += 1;
                                                     state.clips.push((target_track_id, clip));
 
-                                                    let position_secs = ticks_to_secs(drop_tick);
-                                                    let duration_secs = ticks_to_secs(duration_ticks);
+                                                    if mode.drives_engine() {
+                                                        let position_secs = ticks_to_secs(drop_tick);
+                                                        let duration_secs = ticks_to_secs(duration_ticks);
 
-                                                    // Se manda UN solo comando directo al audio engine
-                                                    audio_proxy.send(GuiCommand::LoadClip {
-                                                        clip_id: created_clip_id,
-                                                        path: sample_path_str,
-                                                        position_secs,
-                                                        duration_secs,
-                                                        offset_secs: 0.0,
-                                                        track_index: target_track_id,
-                                                    });
+                                                        // Se manda UN solo comando directo al audio engine
+                                                        audio_proxy.send(GuiCommand::LoadClip {
+                                                            clip_id: created_clip_id,
+                                                            path: sample_path_str,
+                                                            position_secs,
+                                                            duration_secs,
+                                                            offset_secs: 0.0,
+                                                            track_index: target_track_id,
+                                                        });
+                                                    }
+                                                    // TODO(FASE 4 - hikaru_sequencer): cuando exista el
+                                                    // scheduler de Clip Launcher, este sub-clip local debe
+                                                    // registrarse ahí para reproducirse al disparar el pad
+                                                    // de la Session Matrix.
                                                 }
                                             }
                                         }
