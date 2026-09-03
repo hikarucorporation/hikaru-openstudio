@@ -10,7 +10,7 @@
 
 ```bash
 
-alex@msi-cx61:~/Documentos/Codigo_Fuente/hikaru-workspace$ tree -I 'target|.git|node_modules|*.png|*.jpg' --dirsfirst
+user@msi-cx61:~/Documentos/Codigo_Fuente/hikaru-workspace$ tree -I 'target|.git|node_modules|*.png|*.jpg' --dirsfirst
 .
 ├── crates
 │   ├── hikaru_audio_engine
@@ -121,7 +121,7 @@ alex@msi-cx61:~/Documentos/Codigo_Fuente/hikaru-workspace$ tree -I 'target|.git|
 └── LICENSE-ES
 
 34 directories, 74 files
-alex@msi-cx61:~/Documentos/Codigo_Fuente/hikaru-workspace$ 
+user@msi-cx61:~/Documentos/Codigo_Fuente/hikaru-workspace$ 
 
 ```
 
