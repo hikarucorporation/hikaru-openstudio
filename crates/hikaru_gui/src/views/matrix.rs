@@ -20,32 +20,14 @@ pub enum SlotState {
     QueuedToStop,
 }
 
-/// Un `MatrixClip` es ahora un contenedor de Playlist en miniatura: su
-/// contenido (`local_state.clips`) son `playlist::PlaylistClip` reales
-/// (mismo `ClipType::Audio`, mismos peaks, mismo sistema de ticks/PPQN) que
-/// los del Arranger principal. Esto elimina la necesidad de `SubAudioClip`
-/// y de cualquier lógica de render/slice/drag&drop duplicada: todo eso vive
-/// una sola vez en `playlist.rs` y se reutiliza acá vía `playlist::show_embedded`.
 #[derive(Clone, Debug)]
 pub struct MatrixClip {
     pub id: usize,
     pub name: String,
     pub path: PathBuf,
     pub duration_secs: f64,
-
-    /// Estado de Playlist embebido (ticks locales en PPQN, zoom, selección,
-    /// clipboard, etc.) — exactamente el mismo tipo que usa `playlist.rs`.
     pub local_state: PlaylistState,
-
-    /// Pseudo-pista que representa el carril único del Clip Editor. Se
-    /// renderiza con el mismo header (nombre, mute, solo, pan, volumen) que
-    /// cualquier pista de la Playlist principal. Su `id` es local al
-    /// contenedor (no se cruza con los ids reales del Mixer).
     pub local_track: Track,
-
-    /// Posición del cursor dentro del contenedor, en compases (mismo
-    /// formato que `current_bar` en `playlist.rs`). Independiente del
-    /// transporte global: mover este cursor NUNCA dispara `GuiCommand::Seek`.
     pub local_bar: f32,
 }
 
@@ -77,15 +59,12 @@ pub struct SceneMeta {
 }
 
 pub struct SessionMatrixState {
-    /// Matriz dinámica de Slots [track_idx][scene_idx]
     pub grid: Vec<Vec<MatrixSlot>>,
     pub tracks: Vec<TrackMeta>,
     pub scenes: Vec<SceneMeta>,
     pub next_clip_id: usize,
-    pub selected_slot: Option<(usize, usize)>, // (track_idx, scene_idx)
-    pub editor_height: f32,                     // Control dinámico de altura para el Editor
-    /// Zoom horizontal por defecto para el `PlaylistState` local de cada
-    /// `MatrixClip` recién creado (cada clip después puede tener el suyo).
+    pub selected_slot: Option<(usize, usize)>,
+    pub editor_height: f32,
     pub editor_zoom_x: f32,
 }
 
@@ -185,9 +164,8 @@ pub fn show(
     bpm: f64,
     sample_rate: u32,
 ) {
-    // --- BARRA SUPERIOR DE CONTROL DE MATRIZ ---
     ui.horizontal(|ui| {
-        ui.heading("CLIP LAUNCHER (OPENLIVE)");
+        ui.heading("SESSION MATRIX"); // LOCO, no cambiés esto por nada en el mundo[cite: 11]
         ui.add_space(20.0);
 
         ui.group(|ui| {
@@ -217,9 +195,7 @@ pub fn show(
 
     ui.add_space(6.0);
 
-    // Layout principal vertical
     ui.vertical(|ui| {
-        // 1. AREA SUPERIOR: MATRIX GRID
         let remaining_height = ui.available_height() - state.editor_height - 10.0;
 
         ui.allocate_ui(Vec2::new(ui.available_width(), remaining_height.max(100.0)), |ui| {
@@ -278,7 +254,6 @@ pub fn show(
             });
         });
 
-        // 2. BARRA RESIZER MANUAL (Sin el bug imán de TopBottomPanel)
         let (resizer_rect, resizer_response) = ui.allocate_exact_size(
             Vec2::new(ui.available_width(), 6.0),
             Sense::drag(),
@@ -298,7 +273,6 @@ pub fn show(
             ui.painter().rect_filled(resizer_rect, 0.0, Color32::from_rgb(0, 255, 255));
         }
 
-        // 3. AREA INFERIOR: CLIP EDITOR (instancia real de la Playlist)
         ui.allocate_ui(Vec2::new(ui.available_width(), state.editor_height), |ui| {
             render_clip_editor_track_view(ui, state, dragged_sample, audio_proxy, bpm, sample_rate);
         });
@@ -380,7 +354,7 @@ fn render_pad(
 
         if ui.input(|i| i.pointer.any_released()) {
             if let Some(sample_path) = dragged_sample.take() {
-                if is_audio_file(&sample_path) {
+                if crate::views::explorer::is_audio_file(&sample_path) {
                     state.selected_slot = Some((track_idx, scene_idx));
                     load_clip_into_slot(state, audio_proxy, track_idx, scene_idx, sample_path, bpm);
                 }
@@ -390,7 +364,7 @@ fn render_pad(
         let dropped_files = ui.input(|i| i.raw.dropped_files.clone());
         if let Some(file) = dropped_files.first() {
             if let Some(path) = &file.path {
-                if is_audio_file(path) {
+                if crate::views::explorer::is_audio_file(path) {
                     state.selected_slot = Some((track_idx, scene_idx));
                     load_clip_into_slot(state, audio_proxy, track_idx, scene_idx, path.clone(), bpm);
                 }
@@ -399,13 +373,6 @@ fn render_pad(
     }
 }
 
-/// Clip Editor: ya NO dibuja rectángulos simplificados a mano. En su lugar,
-/// arma un `Vec<Track>` de una sola pseudo-pista (`clip.local_track`) y le
-/// pasa el `PlaylistState` embebido del `MatrixClip` seleccionado a
-/// `playlist::show_embedded`. Esto reutiliza tal cual: header/panel de
-/// track, rejilla de ticks/compases, render de waveforms, selección, trim,
-/// slice ('S') y drag&drop de samples desde el File Explorer — sin
-/// duplicar ni un renglón de esa lógica acá.
 fn render_clip_editor_track_view(
     ui: &mut Ui,
     state: &mut SessionMatrixState,
@@ -414,6 +381,20 @@ fn render_clip_editor_track_view(
     bpm: f64,
     sample_rate: u32,
 ) {
+    // Si hay un clip seleccionado y el motor está reproduciendo, actualizamos la aguja (playhead)
+    if let Some((track_idx, scene_idx)) = state.selected_slot {
+        if let Some(slot) = state.grid.get_mut(track_idx).and_then(|r| r.get_mut(scene_idx)) {
+            if slot.state == SlotState::Playing {
+                // Calculamos la posición en base al BPM
+                let samples_per_beat = (sample_rate as f64 * 60.0) / bpm;
+                let samples_per_bar = samples_per_beat * 4.0;
+                
+                // Avanzamos el cursor local
+                slot.clip.as_mut().unwrap().local_bar += (1.0 / samples_per_bar) as f32;
+            }
+        }
+    }
+
     Frame::none()
         .fill(Color32::from_rgb(20, 20, 24))
         .stroke(Stroke::new(1.0_f32, Color32::from_gray(45)))
@@ -450,10 +431,6 @@ fn render_clip_editor_track_view(
             );
 
             let clip = state.grid[track_idx][scene_idx].clip.as_mut().unwrap();
-
-            // `playlist::show_embedded` espera un `&mut Vec<Track>`: le damos
-            // una vista de una sola pista, que es exactamente el header del
-            // carril del Clip Editor.
             let mut local_tracks = vec![clip.local_track.clone()];
 
             playlist::show_embedded(
@@ -468,9 +445,6 @@ fn render_clip_editor_track_view(
                 &title,
             );
 
-            // `show_embedded` puede haber tocado mute/solo/pan/volumen/nombre
-            // del header (misma UI que en la Playlist principal); lo
-            // persistimos de vuelta en el `MatrixClip`.
             if let Some(updated_track) = local_tracks.into_iter().next() {
                 clip.local_track = updated_track;
             }
@@ -499,9 +473,6 @@ fn load_clip_into_slot(
     let mut local_state = PlaylistState::default();
     local_state.zoom_x = state.editor_zoom_x;
 
-    // Reutilizamos el mismo cargador de audio (hound + peaks) que usa la
-    // Playlist principal, así el sub-clip inicial es un `ClipType::Audio`
-    // 100% compatible con `playlist.rs`.
     let sub_clip_id = local_state.next_clip_id;
     local_state.next_clip_id += 1;
     let initial_sub_clip = playlist::build_audio_clip(
@@ -513,8 +484,6 @@ fn load_clip_into_slot(
         bpm,
         Color32::from_rgb(32, 95, 145),
     );
-    // El id de pseudo-pista local es siempre 0: hay una sola pista dentro
-    // del contenedor y no se cruza con los ids reales del Mixer.
     local_state.clips.push((0, initial_sub_clip));
 
     state.grid[track_idx][scene_idx] = MatrixSlot {
@@ -530,11 +499,6 @@ fn load_clip_into_slot(
         }),
     };
 
-    // TODO(FASE 4 - hikaru_sequencer): este LoadClip sigue apuntando al
-    // track real del Mixer (track_idx) porque el scheduler de Clip Launcher
-    // todavía no existe. Cuando exista, la reproducción de los sub-clips
-    // internos del MatrixClip debe pasar por el sequencer, no disparar el
-    // motor directamente acá.
     audio_proxy.send(GuiCommand::LoadClip {
         clip_id: new_id,
         path: path_str,
@@ -542,6 +506,7 @@ fn load_clip_into_slot(
         duration_secs: 0.0,
         offset_secs: 0.0,
         track_index: track_idx,
+        scene_index: scene_idx,
     });
 }
 
@@ -554,6 +519,7 @@ fn trigger_pad(state: &mut SessionMatrixState, audio_proxy: &AudioProxy, track_i
 
     match current_state {
         SlotState::Stopped => {
+            // Apagamos visualmente cualquier otro clip que estuviera sonando EN LA MISMA PISTA
             for s in 0..state.scenes.len() {
                 if s != scene_idx && state.grid[track_idx][s].state == SlotState::Playing {
                     state.grid[track_idx][s].state = SlotState::Stopped;
@@ -561,6 +527,7 @@ fn trigger_pad(state: &mut SessionMatrixState, audio_proxy: &AudioProxy, track_i
             }
             state.grid[track_idx][scene_idx].state = SlotState::Playing;
 
+            // ÚNICAMENTE disparamos el evento de este pad
             audio_proxy.send(GuiCommand::TriggerClip {
                 track_idx,
                 scene_idx,
@@ -569,6 +536,7 @@ fn trigger_pad(state: &mut SessionMatrixState, audio_proxy: &AudioProxy, track_i
         SlotState::Playing => {
             state.grid[track_idx][scene_idx].state = SlotState::Stopped;
 
+            // Al volver a tocarlo, enviamos la orden para detener ese pad puntual
             audio_proxy.send(GuiCommand::TriggerClip {
                 track_idx,
                 scene_idx,
@@ -581,18 +549,21 @@ fn trigger_pad(state: &mut SessionMatrixState, audio_proxy: &AudioProxy, track_i
 fn trigger_scene(state: &mut SessionMatrixState, audio_proxy: &AudioProxy, scene_idx: usize) {
     for track_idx in 0..state.tracks.len() {
         if state.grid[track_idx][scene_idx].clip.is_some() {
-            trigger_pad(state, audio_proxy, track_idx, scene_idx);
+            // Detenemos los otros clips de las pistas correspondientes y marcamos como playing
+            for s in 0..state.scenes.len() {
+                if s != scene_idx && state.grid[track_idx][s].state == SlotState::Playing {
+                    state.grid[track_idx][s].state = SlotState::Stopped;
+                }
+            }
+            state.grid[track_idx][scene_idx].state = SlotState::Playing;
+
+            audio_proxy.send(GuiCommand::TriggerClip {
+                track_idx,
+                scene_idx,
+            });
         }
     }
 
+    // Enviamos el disparo masivo de la escena sin forzar Seek/Play global
     audio_proxy.send(GuiCommand::TriggerScene { scene_idx });
-}
-
-fn is_audio_file(path: &PathBuf) -> bool {
-    path.extension()
-        .map(|ext| {
-            let ext_str = ext.to_string_lossy().to_lowercase();
-            ext_str == "wav" || ext_str == "flac" || ext_str == "ogg" || ext_str == "mp3"
-        })
-        .unwrap_or(false)
 }

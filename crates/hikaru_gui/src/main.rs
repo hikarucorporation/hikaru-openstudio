@@ -8,6 +8,7 @@ use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use hikaru_core::SampleRate;
+use hikaru_audio_engine::EngineMode; // <--- Importamos EngineMode
 use hikaru_gui::app::HikaruApp;
 use hikaru_gui::audio_proxy::{AudioProxy, GuiCommand};
 
@@ -34,6 +35,16 @@ fn main() -> Result<(), eframe::Error> {
     std::thread::spawn(move || {
         while let Ok(command) = rx.recv() {
             match command {
+                // Sincronización del modo GUI -> Motor
+                GuiCommand::SetAppMode(is_studio) => {
+                    if let Ok(mut engine) = engine_for_commands.lock() {
+                        if is_studio {
+                            engine.set_mode(EngineMode::OpenStudio);
+                        } else {
+                            engine.set_mode(EngineMode::OpenLive);
+                        }
+                    }
+                }
                 GuiCommand::Play => {
                     if let Ok(mut engine) = engine_for_commands.lock() {
                         engine.play();
@@ -55,13 +66,13 @@ fn main() -> Result<(), eframe::Error> {
                         engine.seek(secs);
                     }
                 }
-                GuiCommand::UpdateClipBounds { clip_id, position_secs, duration_secs, offset_secs } => {
+                GuiCommand::UpdateClipBounds { clip_id, track_index, scene_index, position_secs, duration_secs, offset_secs } => {
                     if let Ok(mut engine) = engine_for_commands.lock() {
-                        engine.update_clip_bounds(clip_id, position_secs, duration_secs, offset_secs);
+                        engine.update_clip_bounds(clip_id, track_index, scene_index, position_secs, duration_secs, offset_secs);
                     }
                 }
-                GuiCommand::LoadClip { clip_id, path, position_secs, duration_secs, offset_secs, .. } => {
-                    println!("[Hikaru Engine] Cargando clip de Playlist: {} en {:.2}s", path, position_secs);
+                GuiCommand::LoadClip { clip_id, path, position_secs, duration_secs, offset_secs, track_index, scene_index } => {
+                    println!("[Hikaru Engine] Cargando clip de Matrix/Playlist: {} en Track {}", path, track_index);
 
                     if let Ok(mut reader) = hound::WavReader::open(&path) {
                         let spec = reader.spec();
@@ -88,14 +99,22 @@ fn main() -> Result<(), eframe::Error> {
                                 raw_samples
                             };
 
-                            // Usamos el clip_id y los límites REALES que manda la GUI, no los recalculamos.
-                            engine.add_clip(clip_id, final_samples, position_secs, duration_secs, offset_secs, channels);
+                            engine.add_clip(
+                                clip_id,
+                                track_index,
+                                scene_index,
+                                final_samples,
+                                position_secs,
+                                duration_secs,
+                                offset_secs,
+                                channels,
+                            );
                         }
                     } else {
-                        eprintln!("[Hikaru Engine Error] No se pudo abrir el WAV para la Playlist: {}", path);
+                        eprintln!("[Hikaru Engine Error] No se pudo abrir el WAV: {}", path);
                     }
                 }
-                GuiCommand::PreviewSample { path, .. } => {
+                GuiCommand::PreviewSample { path, volume, speed: _ } => {
                     println!("[Hikaru Engine] Cargando preview: {}", path);
 
                     if let Ok(mut reader) = hound::WavReader::open(&path) {
@@ -123,15 +142,21 @@ fn main() -> Result<(), eframe::Error> {
                                 raw_samples
                             };
 
-                            let duration_secs = final_samples.len() as f32 / (channels as f32 * target_sr);
-
-                            engine.clips.clear();
-                            engine.add_clip(0, final_samples, 0.0, duration_secs, 0.0, channels);
-                            engine.seek(0.0);
-                            engine.play();
+                            engine.preview_player.set_volume(volume);
+                            engine.preview_player.play(final_samples);
                         }
                     } else {
                         eprintln!("[Hikaru Engine Error] No se pudo abrir el archivo WAV: {}", path);
+                    }
+                }
+                GuiCommand::StopPreview => {
+                    if let Ok(mut engine) = engine_for_commands.lock() {
+                        engine.preview_player.play(Vec::new());
+                    }
+                }
+                GuiCommand::SetPreviewVolume(vol) => {
+                    if let Ok(mut engine) = engine_for_commands.lock() {
+                        engine.preview_player.set_volume(vol);
                     }
                 }
 
@@ -167,9 +192,10 @@ fn main() -> Result<(), eframe::Error> {
                                     raw_samples
                                 };
 
-                                // clip_id, duration_secs y offset_secs ahora vienen de la GUI (ver AudioClipData actualizado)
                                 engine.add_clip(
                                     clip_data.clip_id,
+                                    clip_data.track_index, // slot real de la pista en el Playlist
+                                    0,                      // scene_index: Playlist es lineal, no usa escenas
                                     final_samples,
                                     clip_data.start_secs,
                                     clip_data.duration_secs,

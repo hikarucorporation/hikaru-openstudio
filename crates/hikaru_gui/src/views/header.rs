@@ -30,7 +30,7 @@ fn format_timecode(bars: f32, bpm: f64) -> String {
 pub fn show(
     ui: &mut Ui, 
     transport: &mut TransportPosition,
-    position_clock: &Arc<AtomicU64>, // <--- PASAMOS EL ATÓMICO ACÁ 
+    position_clock: &Arc<AtomicU64>,
     is_looping: &mut bool,
     is_recording: &mut bool,
     mode: &mut AppMode, 
@@ -81,29 +81,40 @@ pub fn show(
                 if ui.add_sized(btn_size, Button::new(RichText::new("▶").size(16.0).color(play_txt)).fill(play_bg)).clicked() {
                     transport.playback_state = TransportPlaybackState::Playing;
 
-                    let bpm = transport.bpm as f32;
-                    let seconds_per_tick = 60.0 / (bpm * playlist_state.ppqn as f32);
+                    match *mode {
+                        AppMode::OpenStudio => {
+                            // En Studio sincronizamos los clips lineales del timeline
+                            let bpm = transport.bpm as f32;
+                            let seconds_per_tick = 60.0 / (bpm * playlist_state.ppqn as f32);
 
-                    let clips_to_sync: Vec<AudioClipData> = playlist_state // HOTFIX CLAUDE #2
-                        .clips
-                        .iter()
-                        .filter_map(|(track_id, clip)| {
-                            if let ClipType::Audio { sample_path, sample_offset_ticks, .. } = &clip.clip_type {
-                                Some(AudioClipData {
-                                    clip_id: clip.id,
-                                    path: sample_path.clone(),
-                                    start_secs: clip.start_tick as f32 * seconds_per_tick,
-                                    duration_secs: clip.duration_ticks as f32 * seconds_per_tick,
-                                    offset_secs: *sample_offset_ticks as f32 * seconds_per_tick,
-                                    track_index: *track_id,
+                            let clips_to_sync: Vec<AudioClipData> = playlist_state
+                                .clips
+                                .iter()
+                                .filter_map(|(track_id, clip)| {
+                                    if let ClipType::Audio { sample_path, sample_offset_ticks, .. } = &clip.clip_type {
+                                        Some(AudioClipData {
+                                            clip_id: clip.id,
+                                            path: sample_path.clone(),
+                                            start_secs: clip.start_tick as f32 * seconds_per_tick,
+                                            duration_secs: clip.duration_ticks as f32 * seconds_per_tick,
+                                            offset_secs: *sample_offset_ticks as f32 * seconds_per_tick,
+                                            track_index: *track_id,
+                                        })
+                                    } else {
+                                        None
+                                    }
                                 })
-                            } else {
-                                None
-                            }
-                        })
-                        .collect();
+                                .collect();
 
-                    audio_proxy.send(GuiCommand::SyncPlaylistClips { clips: clips_to_sync });
+                            audio_proxy.send(GuiCommand::SyncPlaylistClips { clips: clips_to_sync });
+                        }
+                        AppMode::OpenLive => {
+                            // En Live no enviamos clips de la playlist ni previews del explorer.
+                            // Simplemente nos aseguramos de que el motor corra en modo OpenLive (false).
+                            audio_proxy.send(GuiCommand::SetAppMode(false));
+                        }
+                    }
+
                     audio_proxy.send(GuiCommand::Seek { sample_count: transport.sample_count });
                     audio_proxy.send(GuiCommand::Play);
                 }
@@ -192,13 +203,26 @@ pub fn show(
                 ui.add_space(10.0);
                 ui.add(Separator::default().vertical());
 
-                // Selector de Modo
-                ui.selectable_value(mode, AppMode::OpenLive, "OPENLIVE");
-                ui.selectable_value(mode, AppMode::OpenStudio, "OPENSTUDIO");
+                // Selector de Modo con intercepción de cambio
+                if ui.selectable_label(*mode == AppMode::OpenLive, "OPENLIVE").clicked() {
+                    if *mode != AppMode::OpenLive {
+                        *mode = AppMode::OpenLive;
+                        transport.playback_state = TransportPlaybackState::Stopped;
+                        transport.sample_count = 0;
+                        audio_proxy.send(GuiCommand::Stop);
+                        audio_proxy.send(GuiCommand::SetAppMode(false)); // false = OpenLive
+                    }
+                }
 
-                ui.add_space(10.0);
-                ui.add(Separator::default().vertical());
-                ui.add_space(10.0);
+                if ui.selectable_label(*mode == AppMode::OpenStudio, "OPENSTUDIO").clicked() {
+                    if *mode != AppMode::OpenStudio {
+                        *mode = AppMode::OpenStudio;
+                        transport.playback_state = TransportPlaybackState::Stopped;
+                        transport.sample_count = 0;
+                        audio_proxy.send(GuiCommand::Stop);
+                        audio_proxy.send(GuiCommand::SetAppMode(true)); // true = OpenStudio
+                    }
+                }
 
                 // BPM del transport
                 ui.label(RichText::new("BPM").strong());
@@ -209,8 +233,8 @@ pub fn show(
                 ui.add_space(10.0);
 
                 // Ventanas
-                ui.toggle_value(show_mixer, "󰓠 MIXER (F9)");
-                ui.toggle_value(show_dsp_rack, "󰓠 DSP RACK (F10)");
+                ui.toggle_value(show_mixer, "MIXER (F9)");
+                ui.toggle_value(show_dsp_rack, "DSP RACK (F10)");
                 ui.toggle_value(show_explorer, "📁 EXPLORER (F11)");
             });
         });

@@ -31,23 +31,27 @@ impl AudioProxy {
 }
 
 pub enum GuiCommand {
+    SetAppMode(bool), // true = OpenStudio, false = OpenLive
     Play,
     Pause,
     Stop,
     Seek { 
         sample_count: u64 
     },
-    // ACTUALIZADO: Pasamos el clip_id y sus límites al cargar
+    // ACTUALIZADO: Pasamos el clip_id, su slot (track/scene) y sus límites al cargar
     LoadClip { 
         clip_id: usize,
         path: String, 
         position_secs: f32, 
         duration_secs: f32,
         offset_secs: f32,
-        track_index: usize 
+        track_index: usize,
+        scene_index: usize,
     },
     UpdateClipBounds { 
         clip_id: usize, 
+        track_index: usize,
+        scene_index: usize,
         position_secs: f32, 
         duration_secs: f32, 
         offset_secs: f32 

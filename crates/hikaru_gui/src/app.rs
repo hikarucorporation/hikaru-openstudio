@@ -137,18 +137,28 @@ impl eframe::App for HikaruApp {
 
         // --- LÓGICA DE TRANSPORTE Y REPRODUCCIÓN EN TIEMPO REAL ---
         if self.transport.playback_state == TransportPlaybackState::Playing {
-            // 1. Sincronización exacta con el reloj del AudioEngine
+            // Sincronización exacta con el reloj del AudioEngine
             self.transport.sample_count = self.position_clock.load(Ordering::Relaxed);
 
-            // 2. Control de Loop si está activo
-            if self.is_looping {
-                let samples_per_beat = (self.transport.sample_rate.get() as f64 * 60.0) / self.transport.bpm;
-                let samples_per_bar = samples_per_beat * self.transport.beats_per_bar as f64;
-                let loop_end_sample = (samples_per_bar * 16.0) as u64;
+            match self.mode {
+                AppMode::OpenStudio => {
+                    // En OpenStudio procesamos el avance del timeline lineal y su loop
+                    if self.is_looping {
+                        let samples_per_beat = (self.transport.sample_rate.get() as f64 * 60.0) / self.transport.bpm;
+                        let samples_per_bar = samples_per_beat * self.transport.beats_per_bar as f64;
+                        let loop_end_sample = (samples_per_bar * 16.0) as u64;
 
-                if self.transport.sample_count >= loop_end_sample {
+                        if self.transport.sample_count >= loop_end_sample {
+                            self.transport.sample_count = 0;
+                            self.audio_proxy.send(GuiCommand::Seek { sample_count: 0 });
+                        }
+                    }
+                }
+                AppMode::OpenLive => {
+                    // En OpenLive el Master Clock corre en segundo plano para la cuantización de los clips,
+                    // pero forzamos un seek a 0 o mudo para la playlist si intentara sonar.
+                    // Si querés que la barra del timeline no avance visualmente en el fondo:
                     self.transport.sample_count = 0;
-                    self.audio_proxy.send(GuiCommand::Seek { sample_count: 0 });
                 }
             }
 
