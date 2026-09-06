@@ -480,6 +480,8 @@ fn render_clip_editor_track_view(
                 bpm,
                 sample_rate,
                 &title,
+                transport_sample_count,
+                4,
             );
 
             if let Some(updated_track) = local_tracks.into_iter().next() {

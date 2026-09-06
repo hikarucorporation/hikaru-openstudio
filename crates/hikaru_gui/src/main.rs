@@ -243,6 +243,15 @@ fn main() -> Result<(), eframe::Error> {
         }
     };
 
+    // SR real del hardware (44100/48000/...): el engine ya se actualizó en
+    // `init_cpal_stream`; la GUI debe usar el MISMO valor o el cursor corre
+    // desincronizado del audio. Se lee del engine y se inyecta en el
+    // transporte GUI al crear la app.
+    let hardware_sr: f32 = engine_arc
+        .lock()
+        .map(|engine| engine.sample_rate)
+        .unwrap_or(44100.0);
+
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Hikaru OpenStudio")
@@ -254,7 +263,10 @@ fn main() -> Result<(), eframe::Error> {
         "Hikaru OpenStudio",
         native_options,
         Box::new(move |cc| {
-            Box::new(HikaruApp::new(cc, audio_proxy, audio_stream, position_clock))
+            let mut app = HikaruApp::new(cc, audio_proxy, audio_stream, position_clock);
+            // Transporte GUI con el SR real del motor (no 44100 fijo).
+            app.sync_hardware_sample_rate(hardware_sr);
+            Box::new(app)
         }),
     )
 }

@@ -11,6 +11,7 @@ use std::f32::consts::PI;
 use std::path::PathBuf;
 use crate::views::mixer::Track;
 use crate::audio_proxy::{AudioProxy, GuiCommand};
+use hikaru_transport::DEFAULT_PPQN;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ViewMode<'a> {
@@ -119,7 +120,7 @@ impl Default for PlaylistState {
         Self {
             clips: Vec::new(),
             playhead_tick: 0,
-            ppqn: 960,
+            ppqn: DEFAULT_PPQN,
             next_clip_id: 1,
             header_width: 180.0,
             grid_numerator: 1,
@@ -267,6 +268,44 @@ fn px_to_ticks(px: f32, zoom_x: f32) -> u64 {
 #[inline]
 fn ticks_to_px(ticks: u64, zoom_x: f32) -> f32 {
     ticks as f32 * zoom_x
+}
+
+/// Mapeo exacto Ticks -> Píxeles con el PPQN único del motor.
+///
+/// Fórmula canónica:
+/// `pixel_x = (ticks as f32 / ppqn as f32) * pixels_per_beat + playlist_offset_x`
+/// donde `pixels_per_beat = ppqn as f32 * zoom_x`, por lo que equivale a
+/// `ticks * zoom_x + offset`. Se mantiene explícita para auditar que el
+/// PPQN usado aquí sea siempre `DEFAULT_PPQN` / `transport.ppqn()`.
+#[inline]
+fn ticks_to_pixel_x(ticks: u64, ppqn: u64, zoom_x: f32, playlist_offset_x: f32) -> f32 {
+    let ppqn = ppqn.max(1) as f32;
+    let pixels_per_beat = ppqn * zoom_x;
+    (ticks as f32 / ppqn) * pixels_per_beat + playlist_offset_x
+}
+
+/// Samples -> ticks con el BPM activo y el Sample Rate real del motor.
+/// Inversa exacta de `ticks_to_samples_precise`.
+#[inline]
+fn samples_to_ticks_precise(sample_count: u64, ppqn: u64, bpm: f64, sample_rate: u32) -> u64 {
+    let ppqn = ppqn.max(1);
+    if bpm <= 0.0 || sample_rate == 0 {
+        return 0;
+    }
+    let seconds = sample_count as f64 / sample_rate as f64;
+    let seconds_per_tick = (60.0 / bpm) / ppqn as f64;
+    (seconds / seconds_per_tick).round() as u64
+}
+
+/// Ticks -> samples con el BPM activo y el Sample Rate real del motor.
+#[inline]
+fn ticks_to_samples_precise(ticks: u64, ppqn: u64, bpm: f64, sample_rate: u32) -> u64 {
+    let ppqn = ppqn.max(1);
+    if bpm <= 0.0 || sample_rate == 0 {
+        return 0;
+    }
+    let seconds_per_tick = (60.0 / bpm) / ppqn as f64;
+    (ticks as f64 * seconds_per_tick * sample_rate as f64).round() as u64
 }
 
 #[inline]
@@ -434,10 +473,12 @@ pub fn show(
     bpm: f64,
     sample_rate: u32,
     loop_enabled: bool,
+    transport_sample_count: u64,
+    beats_per_bar: u32,
 ) {
     show_impl(
         ui, state, tracks, current_bar, dragged_sample, audio_proxy, bpm, sample_rate,
-        ViewMode::Arranger, loop_enabled,
+        ViewMode::Arranger, loop_enabled, transport_sample_count, beats_per_bar,
     );
 }
 
@@ -451,6 +492,8 @@ pub fn show_embedded(
     bpm: f64,
     sample_rate: u32,
     title: &str,
+    transport_sample_count: u64,
+    beats_per_bar: u32,
 ) {
     // En modo OPENLIVE / ClipEditor el Shift+Drag sobre la regla define el
     // loop individual del clip (`clip.loop_start` / `clip.loop_end` via
@@ -458,7 +501,7 @@ pub fn show_embedded(
     // transporte global. Se habilita siempre (true).
     show_impl(
         ui, state, tracks, local_bar, dragged_sample, audio_proxy, bpm, sample_rate,
-        ViewMode::ClipEditor { title }, true,
+        ViewMode::ClipEditor { title }, true, transport_sample_count, beats_per_bar,
     );
 }
 
@@ -473,17 +516,36 @@ fn show_impl(
     sample_rate: u32,
     mode: ViewMode,
     loop_enabled: bool,
+    transport_sample_count: u64,
+    beats_per_bar: u32,
 ) {
+    // Sincronización PPQN: la GUI no hardcodea 960; la única fuente de
+    // verdad es `DEFAULT_PPQN` (= `transport.ppqn()`). Si el estado trae
+    // otro valor (snapshot viejo), se corrige aquí cada frame.
+    if state.ppqn != DEFAULT_PPQN {
+        state.ppqn = DEFAULT_PPQN;
+    }
     // Sincronización completa automática si es requerida al arrancar o cambiar vista
     if mode.drives_engine() && state.needs_full_sync {
         state.sync_all_clips_to_engine(audio_proxy, bpm);
     }
 
-    let ticks_per_bar = state.ppqn * 4;
-    state.playhead_tick = ((*current_bar - 1.0).max(0.0) as f64 * ticks_per_bar as f64).round() as u64;
+    // Playhead exacto: samples -> ticks con BPM activo + SR real + PPQN único.
+    // NO se deriva de `current_bar: f32` (pierde precisión y corre más rápido
+    // que el audio); el bar solo se deriva para compatibilidad visual.
+    let ppqn = state.ppqn.max(1);
+    let beats_per_bar = beats_per_bar.max(1);
+    let ticks_per_bar = ppqn * beats_per_bar as u64;
+    let bpm_safe = bpm.max(1.0);
+    state.playhead_tick =
+        samples_to_ticks_precise(transport_sample_count, ppqn, bpm_safe, sample_rate);
+    // Bar visual coherente con el mismo origen (f64, sin pasar por f32).
+    let bar_from_transport =
+        (state.playhead_tick as f64 / ticks_per_bar as f64) + 1.0;
+    *current_bar = bar_from_transport as f32;
 
-    let samples_per_beat = (sample_rate as f64 * 60.0) / bpm.max(1.0);
-    let samples_per_bar = samples_per_beat * 4.0;
+    let _samples_per_beat = (sample_rate as f64 * 60.0) / bpm_safe;
+    let _samples_per_bar = _samples_per_beat * beats_per_bar as f64;
 
     let zoom_x = state.zoom_x;
     let track_height = 54.0_f32;
@@ -506,7 +568,8 @@ fn show_impl(
         state.ensure_minimum_global_loop(loop_enabled);
     }
 
-    let ppqn = state.ppqn;
+    // `ppqn` ya sincronizado arriba con DEFAULT_PPQN (fuente única).
+    let ppqn = state.ppqn.max(1);
 
     // Portapapeles y atajos
     if ctrl && ui.input(|i| i.key_pressed(egui::Key::C)) {
@@ -1562,8 +1625,14 @@ fn show_impl(
                                 state.clips.extend(pending_slices);
                             }
 
-                            // Renderizado del Playhead
-                            let playhead_x = rect.min.x + ticks_to_px(state.playhead_tick, zoom_x);
+                            // Renderizado del Playhead con la fórmula canónica:
+                            // pixel_x = (ticks / ppqn) * pixels_per_beat + offset.
+                            let playhead_x = ticks_to_pixel_x(
+                                state.playhead_tick,
+                                ppqn,
+                                zoom_x,
+                                rect.min.x,
+                            );
                             painter.line_segment(
                                 [Pos2::new(playhead_x, rect.min.y), Pos2::new(playhead_x, rect.max.y)],
                                 Stroke::new(2.0_f32, Color32::from_rgb(0, 255, 255))
@@ -1575,10 +1644,17 @@ fn show_impl(
                                 if let Some(pointer_pos) = response.interact_pointer_pos() {
                                     let rel_x = (pointer_pos.x - rect.min.x).max(0.0);
                                     let clicked_ticks = px_to_ticks(rel_x, zoom_x);
-                                    *current_bar = (clicked_ticks as f32 / ticks_per_bar as f32) + 1.0;
+                                    *current_bar = (clicked_ticks as f64 / ticks_per_bar as f64) as f32 + 1.0;
 
                                     if mode.drives_engine() {
-                                        let target_samples = (((*current_bar - 1.0) as f64).max(0.0) * samples_per_bar).round() as u64;
+                                        // Seek exacto: ticks -> samples con BPM activo
+                                        // + SR real + PPQN único (sin pasar por f32).
+                                        let target_samples = ticks_to_samples_precise(
+                                            clicked_ticks,
+                                            ppqn,
+                                            bpm_safe,
+                                            sample_rate,
+                                        );
                                         audio_proxy.send(GuiCommand::Seek { sample_count: target_samples });
                                     }
                                 }

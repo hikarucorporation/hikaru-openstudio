@@ -35,6 +35,9 @@ pub struct HikaruApp {
     pub position_clock: Arc<AtomicU64>,
     pub is_looping: bool,
     pub cpu_usage: f32,
+    /// Último BPM propagado al motor vía `GuiCommand::SetBpm`.
+    /// Evita spamear al engine cada frame: solo se envía al cambiar.
+    bpm_synced_to_engine: f64,
     pub show_mixer: bool,
     pub show_dsp_rack: bool,
     pub show_about: bool,
@@ -112,19 +115,36 @@ impl HikaruApp {
             selected_track_index: 1,
             selected_slot_index: 0,
             fonts_configured: false,
+            bpm_synced_to_engine: 140.0,
             audio_proxy,
             _audio_stream: audio_stream,
         }
     }
 
+    /// Sincroniza el Sample Rate real del hardware con el transporte GUI.
+    /// Debe llamarse tras `init_cpal_stream` (p. ej. 48000 Hz): sin esto la
+    /// GUI seguiría calculando con 44100 y el cursor correría desincronizado.
+    pub fn sync_hardware_sample_rate(&mut self, hardware_sr: f32) {
+        if hardware_sr > 0.0 {
+            self.transport.sample_rate = SampleRate::new(hardware_sr);
+        }
+    }
+
     pub fn current_bar(&self) -> f32 {
-        let samples_per_second = self.transport.sample_rate.get() as f64;
-        if samples_per_second == 0.0 {
+        // Bar 1-based con BPM activo + SR real + beats_per_bar del transporte.
+        // Cálculo en f64 (el f32 solo al final para la UI).
+        let samples_per_bar = self.transport.samples_per_bar();
+        if samples_per_bar <= 0.0 {
             return 1.0;
         }
-        let seconds = self.transport.sample_count as f64 / samples_per_second;
-        let beats = seconds * (self.transport.bpm as f64 / 60.0);
-        (beats / 4.0) as f32 + 1.0
+        (1.0 + self.transport.sample_count as f64 / samples_per_bar) as f32
+    }
+
+    /// Playhead exacto en ticks con el PPQN único del motor.
+    /// Inversa exacta del tiempo real del audio: no pasa por `f32`.
+    pub fn current_tick(&self) -> u64 {
+        self.transport
+            .samples_to_ticks(self.transport.sample_count)
     }
 }
 
@@ -139,6 +159,19 @@ impl eframe::App for HikaruApp {
         // Siempre sincronizar el reloj del engine para que la posición esté
         // actualizada tanto en OpenStudio como en OpenLive (clips individuales).
         self.transport.sample_count = self.position_clock.load(Ordering::Relaxed);
+
+        // PPQN único: la playlist nunca diverge del motor.
+        // `transport.ppqn()` == `DEFAULT_PPQN` es la única fuente de verdad.
+        self.playlist_state.ppqn = self.transport.ppqn();
+
+        // BPM dinámico: si el header cambió el BPM de la GUI, propagarlo al
+        // motor UNA vez (no cada frame) para que audio y cursor usen el mismo
+        // tempo. Sin esto el cursor corre a un tempo y el audio a otro.
+        if (self.transport.bpm - self.bpm_synced_to_engine).abs() > f64::EPSILON {
+            self.bpm_synced_to_engine = self.transport.bpm;
+            self.audio_proxy
+                .send(GuiCommand::SetBpm(self.transport.bpm as f32));
+        }
 
         if self.transport.playback_state == TransportPlaybackState::Playing {
             match self.mode {
@@ -200,26 +233,24 @@ impl eframe::App for HikaruApp {
                         }
                         // SOLO enviar/aplicar si end > start.
                         if end > start {
-                            let bpm = self.transport.bpm.max(1.0);
-                            let sr = self.transport.sample_rate.get() as f64;
-                            if sr > 0.0 {
-                                let seconds_per_tick = (60.0 / bpm) / ppqn as f64;
-                                let loop_start_samples =
-                                    (start as f64 * seconds_per_tick * sr).round() as u64;
-                                let loop_end_samples =
-                                    (end as f64 * seconds_per_tick * sr).round() as u64;
-                                if loop_end_samples > loop_start_samples
-                                    && self.transport.sample_count >= loop_end_samples
-                                {
-                                    let loop_len = loop_end_samples - loop_start_samples;
-                                    if loop_len > 0 {
-                                        self.transport.sample_count = loop_start_samples
-                                            + ((self.transport.sample_count - loop_start_samples)
-                                                % loop_len);
-                                        self.audio_proxy.send(GuiCommand::Seek {
-                                            sample_count: self.transport.sample_count,
-                                        });
-                                    }
+                            // Wrap en dominio samples con BPM activo + SR real
+                            // + PPQN único (helpers del transporte: sin
+                            // constantes fijas, sin f32 intermedio).
+                            let loop_start_samples =
+                                self.transport.ticks_to_samples(start);
+                            let loop_end_samples =
+                                self.transport.ticks_to_samples(end);
+                            if loop_end_samples > loop_start_samples
+                                && self.transport.sample_count >= loop_end_samples
+                            {
+                                let loop_len = loop_end_samples - loop_start_samples;
+                                if loop_len > 0 {
+                                    self.transport.sample_count = loop_start_samples
+                                        + ((self.transport.sample_count - loop_start_samples)
+                                            % loop_len);
+                                    self.audio_proxy.send(GuiCommand::Seek {
+                                        sample_count: self.transport.sample_count,
+                                    });
                                 }
                             }
                         }
@@ -283,16 +314,10 @@ impl eframe::App for HikaruApp {
         CentralPanel::default().show(ctx, |ui| {
             match self.mode {
                 AppMode::OpenLive => {
-                    let ppqn = 960u64;
-                    let sample_rate = self.transport.sample_rate.get() as f64;
-                    let current_tick = if sample_rate > 0.0 {
-                        let seconds_per_beat = 60.0 / self.transport.bpm;
-                        let seconds_per_tick = seconds_per_beat / ppqn as f64;
-                        let current_seconds = self.transport.sample_count as f64 / sample_rate;
-                        (current_seconds / seconds_per_tick) as u64
-                    } else {
-                        0
-                    };
+                    // Tick exacto con PPQN único + BPM activo + SR real.
+                    // Sin hardcodear 960 ni fórmulas manuales divergentes.
+                    let ppqn = self.transport.ppqn();
+                    let current_tick = self.current_tick();
 
                     matrix::show(
                         ui,
@@ -309,6 +334,8 @@ impl eframe::App for HikaruApp {
                 AppMode::OpenStudio => {
                     // ...
                     let mut current_bar = self.current_bar();
+                    let transport_sample_count = self.transport.sample_count;
+                    let beats_per_bar = self.transport.beats_per_bar;
                     // REAPER: pasar el estado del botón (`is_looping`), no el
                     // `transport.loop_enabled` ya saneado (que es false cuando
                     // aún no hay región). Así `ensure_minimum_global_loop`
@@ -323,6 +350,8 @@ impl eframe::App for HikaruApp {
                         self.transport.bpm,
                         self.transport.sample_rate.get() as u32,
                         self.is_looping,
+                        transport_sample_count,
+                        beats_per_bar,
                     );
                 }
             }
