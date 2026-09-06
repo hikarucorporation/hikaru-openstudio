@@ -213,14 +213,20 @@ fn main() -> Result<(), eframe::Error> {
                         engine.trigger_clip(track_idx, scene_idx);
                     }
                 }
-                GuiCommand::SetClipLoop { track_idx: _, scene_idx: _, loop_start_secs: _, loop_end_secs: _, enabled: _ } => {
-                    // Motor intacto: AudioEngine no expone set_clip_loop en HEAD.
-                    // La guarda ppqn previa al envío ya vive en playlist.rs/app.rs
-                    // (GUI); aquí no se envía rango alguno al DSP.
+                GuiCommand::SetClipLoop { track_idx, scene_idx, loop_start_secs, loop_end_secs, enabled } => {
+                    if let Ok(mut engine) = engine_for_commands.lock() {
+                        engine.set_clip_loop(track_idx, scene_idx, loop_start_secs, loop_end_secs, enabled);
+                    }
                 }
-                GuiCommand::TriggerScene { scene_idx: _ } => {
-                    // Motor intacto: AudioEngine no expone trigger_scene en HEAD.
-                    // No-op en GUI para mantener `cargo check` en verde.
+                GuiCommand::SetGlobalLoop { start_samples, end_samples, enabled } => {
+                    if let Ok(mut engine) = engine_for_commands.lock() {
+                        engine.set_global_loop(start_samples, end_samples, enabled);
+                    }
+                }
+                GuiCommand::TriggerScene { scene_idx } => {
+                    if let Ok(mut engine) = engine_for_commands.lock() {
+                        engine.trigger_scene(scene_idx);
+                    }
                 }
                 GuiCommand::SetBpm(bpm) => {
                     if let Ok(mut engine) = engine_for_commands.lock() {

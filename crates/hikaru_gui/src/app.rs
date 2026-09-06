@@ -38,6 +38,9 @@ pub struct HikaruApp {
     /// Último BPM propagado al motor vía `GuiCommand::SetBpm`.
     /// Evita spamear al engine cada frame: solo se envía al cambiar.
     bpm_synced_to_engine: f64,
+    /// Último loop global propagado al motor vía `SetGlobalLoop`.
+    /// Evita spamear al engine cada frame: solo se envía al cambiar.
+    global_loop_synced_to_engine: Option<(bool, u64, u64)>,
     pub show_mixer: bool,
     pub show_dsp_rack: bool,
     pub show_about: bool,
@@ -116,6 +119,7 @@ impl HikaruApp {
             selected_slot_index: 0,
             fonts_configured: false,
             bpm_synced_to_engine: 140.0,
+            global_loop_synced_to_engine: None,
             audio_proxy,
             _audio_stream: audio_stream,
         }
@@ -174,91 +178,88 @@ impl eframe::App for HikaruApp {
         }
 
         if self.transport.playback_state == TransportPlaybackState::Playing {
-            match self.mode {
-                AppMode::OpenStudio => {
-                    // Guarda GUI previa al envío (anti-congelamiento).
-                    // Antes de activar el loop (`is_looping == true`, equivalente
-                    // a `set_loop_region(start, end)` + `set_loop_enabled(true)`):
-                    // - si `end <= start`, `end = start + (4 * ppqn)`;
-                    // - si `end - start < ppqn`, `end = start + ppqn`;
-                    // - SOLO se usa la región si `end > start`.
-                    // Todo en estado GUI (PlaylistState); no se toca el hilo DSP
-                    // ni transport_state / hikaru_audio_engine.
-                    if self.is_looping {
-                        let ppqn = self.playlist_state.ppqn.max(1);
-                        let mut start = self.playlist_state.loop_start_ticks;
-                        let mut end = self.playlist_state.loop_end_ticks;
-                        let len = end.saturating_sub(start);
-                        if !self.playlist_state.loop_region_active
-                            || end <= start
-                            || len < ppqn
-                        {
-                            // Sin selección válida: estilo REAPER, 0..fin_proyecto.
-                            let total = self.playlist_state.total_project_ticks();
-                            start = 0u64;
-                            end = total.max(4u64.saturating_mul(ppqn));
-                        }
-                        // Verifica el rango en ticks antes de enviar.
-                        if end <= start {
-                            end = start.saturating_add(4u64.saturating_mul(ppqn));
-                        }
-                        if end.saturating_sub(start) < ppqn {
-                            end = start.saturating_add(ppqn);
-                        }
-                        // SOLO confirma en la GUI si la región es válida.
-                        if end > start {
-                            self.playlist_state.loop_start_ticks = start;
-                            self.playlist_state.loop_end_ticks = end;
-                            self.playlist_state.loop_region_active = true;
-                            self.playlist_state.loop_preview_start_ticks = start;
-                            self.playlist_state.loop_preview_end_ticks = end;
-                        }
-                    }
-                    // Envío al transporte: SOLO si la región saneada es válida
-                    // (`end > start`). La región vive en la GUI; el wrap se hace
-                    // aquí vía Seek (sin estado extra en el hilo DSP).
-                    // ORDEN: primero se sanea la región, después se aplica el loop.
-                    if self.is_looping
-                        && self.playlist_state.loop_region_active
-                        && self.playlist_state.is_loop_region_valid()
-                    {
-                        let ppqn = self.playlist_state.ppqn.max(1);
-                        let start = self.playlist_state.loop_start_ticks;
-                        let mut end = self.playlist_state.loop_end_ticks;
-                        if end <= start {
-                            end = start.saturating_add(4u64.saturating_mul(ppqn));
-                        }
-                        if end.saturating_sub(start) < ppqn {
-                            end = start.saturating_add(ppqn);
-                        }
-                        // SOLO enviar/aplicar si end > start.
-                        if end > start {
-                            // Wrap en dominio samples con BPM activo + SR real
-                            // + PPQN único (helpers del transporte: sin
-                            // constantes fijas, sin f32 intermedio).
-                            let loop_start_samples =
-                                self.transport.ticks_to_samples(start);
-                            let loop_end_samples =
-                                self.transport.ticks_to_samples(end);
-                            if loop_end_samples > loop_start_samples
-                                && self.transport.sample_count >= loop_end_samples
-                            {
-                                let loop_len = loop_end_samples - loop_start_samples;
-                                if loop_len > 0 {
-                                    self.transport.sample_count = loop_start_samples
-                                        + ((self.transport.sample_count - loop_start_samples)
-                                            % loop_len);
-                                    self.audio_proxy.send(GuiCommand::Seek {
-                                        sample_count: self.transport.sample_count,
-                                    });
-                                }
-                            }
-                        }
-                    }
+            // Loop global: el ENGINE es el dueño único del wrap
+            // (sample-accurate en `AudioEngine::process`, frame a frame).
+            // La GUI solo configura la región y la envía UNA vez por cambio
+            // vía `SetGlobalLoop`; nunca reescribe `sample_count` ni manda
+            // `Seek` para loopear. El cursor sigue al engine vía
+            // `position_clock`, así `loop_end_ticks` de la barra coincide
+            // exactamente con el wrap del motor.
+            //
+            // OpenStudio: sin región válida se auto-selecciona
+            // 0..fin_proyecto (mínimo 1 compás), estilo REAPER.
+            // OpenLive: la playlist está vacía y NO debe inventarse un loop
+            // de 1 compás (ese era el "reset en el compás 2"): solo hay loop
+            // global si la región es explícita y válida; si no, se propaga
+            // desactivado al engine y los clips loopean su duración real.
+            let is_live = self.mode == AppMode::OpenLive;
+            if self.is_looping && !is_live {
+                let ppqn = self.playlist_state.ppqn.max(1);
+                let mut start = self.playlist_state.loop_start_ticks;
+                let mut end = self.playlist_state.loop_end_ticks;
+                let len = end.saturating_sub(start);
+                if !self.playlist_state.loop_region_active
+                    || end <= start
+                    || len < ppqn
+                {
+                    // Sin selección válida: estilo REAPER, 0..fin_proyecto.
+                    let total = self.playlist_state.total_project_ticks();
+                    start = 0u64;
+                    end = total.max(4u64.saturating_mul(ppqn));
                 }
-                AppMode::OpenLive => {}
+                // Verifica el rango en ticks antes de enviar.
+                if end <= start {
+                    end = start.saturating_add(4u64.saturating_mul(ppqn));
+                }
+                if end.saturating_sub(start) < ppqn {
+                    end = start.saturating_add(ppqn);
+                }
+                // SOLO confirma en la GUI si la región es válida.
+                if end > start {
+                    self.playlist_state.loop_start_ticks = start;
+                    self.playlist_state.loop_end_ticks = end;
+                    self.playlist_state.loop_region_active = true;
+                    self.playlist_state.loop_preview_start_ticks = start;
+                    self.playlist_state.loop_preview_end_ticks = end;
+                }
             }
             ctx.request_repaint();
+        }
+
+        // Sincronización del loop global GUI -> engine (una vez por cambio).
+        // Corre siempre (sonando o no) para que activar/desactivar 🔁 se
+        // propague sin esperar al play.
+        {
+            let ppqn = self.playlist_state.ppqn.max(1);
+            let (want_enabled, want_start, want_end) =
+                if self.is_looping && self.playlist_state.is_loop_region_valid() {
+                    let start = self.playlist_state.loop_start_ticks;
+                    let mut end = self.playlist_state.loop_end_ticks;
+                    if end <= start {
+                        end = start.saturating_add(4u64.saturating_mul(ppqn));
+                    }
+                    if end.saturating_sub(start) < ppqn {
+                        end = start.saturating_add(ppqn);
+                    }
+                    (end > start, start, end)
+                } else {
+                    (false, 0, 0)
+                };
+            let want_start_samples = self.transport.ticks_to_samples(want_start);
+            let want_end_samples = self.transport.ticks_to_samples(want_end);
+            let want = (want_enabled, want_start_samples, want_end_samples);
+            if self.global_loop_synced_to_engine != Some(want) {
+                self.global_loop_synced_to_engine = Some(want);
+                // Espejo local para que la GUI lea lo mismo que el engine.
+                self.transport
+                    .set_loop_region_samples(want_start_samples, want_end_samples);
+                self.transport.set_loop_enabled(want_enabled);
+                self.audio_proxy.send(GuiCommand::SetGlobalLoop {
+                    start_samples: want_start_samples,
+                    end_samples: want_end_samples,
+                    enabled: want_enabled,
+                });
+            }
         }
 
         // En OpenLive, pedir repaint continuo si hay clips disparados en la matriz
@@ -329,6 +330,14 @@ impl eframe::App for HikaruApp {
                         self.transport.bpm,          // <--- Arg 7: f64
                         self.transport.sample_rate.get() as u32, // <--- O .to_u32() / .0 dependiendo del enum
                         self.transport.sample_count,
+                        // Loop global: la Session Matrix respeta la misma
+                        // región `[loop_start_ticks, loop_end_ticks]` y la
+                        // bandera `is_looping` (`loop_enabled`) que la
+                        // Playlist; el wrap se aplica en el bloque de
+                        // transporte (arriba) y en el display de matrix.rs.
+                        self.is_looping,
+                        self.playlist_state.loop_start_ticks,
+                        self.playlist_state.loop_end_ticks,
                     );
                 }
                 AppMode::OpenStudio => {

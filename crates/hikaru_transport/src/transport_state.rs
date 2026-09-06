@@ -24,6 +24,15 @@ pub struct TransportPosition {
     pub beat_division: u32,
     pub sample_count: u64, // Nombre unificado
     pub playback_state: TransportPlaybackState,
+    /// Loop global del transporte (región en SAMPLES, no en ticks).
+    /// La GUI configura esta región vía `set_loop_region_samples` con los
+    /// mismos ticks que muestra la barra (`ticks_to_samples`), y el motor
+    /// (`hikaru_audio_engine::AudioEngine::process`) hace el wrap en el
+    /// callback de audio. Dueño único del wrap: el engine. La GUI nunca
+    /// reescribe `sample_count` por su cuenta para loopear.
+    pub loop_enabled: bool,
+    pub loop_start_samples: u64,
+    pub loop_end_samples: u64,
 }
 
 impl TransportPosition {
@@ -36,6 +45,9 @@ impl TransportPosition {
             beat_division: 4,
             sample_count: 0,
             playback_state: TransportPlaybackState::Stopped,
+            loop_enabled: false,
+            loop_start_samples: 0,
+            loop_end_samples: 0,
         }
     }
 
@@ -109,8 +121,89 @@ impl TransportPosition {
         (seconds / spt).round() as u64
     }
     
+    /// Define la región de loop global en samples.
+    /// `start`/`end` deben venir de `ticks_to_samples` con los mismos ticks
+    /// que muestra la barra del transporte de la GUI, así ambos coinciden
+    /// exactamente. Si `end <= start` la región queda inválida (el wrap es
+    /// identidad hasta que se configure una región válida).
+    pub fn set_loop_region_samples(&mut self, start: u64, end: u64) {
+        self.loop_start_samples = start;
+        self.loop_end_samples = end;
+    }
+
+    /// Activa/desactiva el loop global del transporte.
+    pub fn set_loop_enabled(&mut self, enabled: bool) {
+        self.loop_enabled = enabled;
+    }
+
+    /// Indica si hay una región de loop global válida para el wrap.
+    pub fn has_valid_loop(&self) -> bool {
+        self.loop_enabled && self.loop_end_samples > self.loop_start_samples
+    }
+
+    /// Longitud del loop global en samples (0 si es inválido).
+    pub fn loop_length_samples(&self) -> u64 {
+        self.loop_end_samples.saturating_sub(self.loop_start_samples)
+    }
+
+    /// Mapea una posición absoluta de samples a su posición dentro del loop
+    /// global (`[loop_start, loop_end)`). Si el loop no está habilitado o la
+    /// región es inválida, devuelve `pos` sin cambios (identidad).
+    /// Función pura: el engine la usa por frame en el callback de audio y la
+    /// GUI la usa para derivar el playhead, así ambos ven el mismo reloj.
+    pub fn wrap_sample_count(&self, pos: u64) -> u64 {
+        if !self.has_valid_loop() || pos < self.loop_end_samples {
+            return pos;
+        }
+        let len = self.loop_length_samples();
+        if len == 0 {
+            return pos;
+        }
+        self.loop_start_samples + ((pos - self.loop_start_samples) % len)
+    }
+    
     // Getter para BPM si lo necesitás como f64
     pub fn get_bpm(&self) -> f64 {
         self.bpm
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_transport() -> TransportPosition {
+        TransportPosition::new(SampleRate::new(44100.0), 120.0)
+    }
+
+    #[test]
+    fn loop_disabled_is_identity() {
+        let t = test_transport();
+        assert!(!t.has_valid_loop());
+        assert_eq!(t.wrap_sample_count(1_000_000), 1_000_000);
+    }
+
+    #[test]
+    fn loop_wraps_into_region() {
+        let mut t = test_transport();
+        t.set_loop_region_samples(1000, 5000);
+        t.set_loop_enabled(true);
+        assert!(t.has_valid_loop());
+        assert_eq!(t.loop_length_samples(), 4000);
+        // Antes del fin: identidad.
+        assert_eq!(t.wrap_sample_count(4999), 4999);
+        // En el fin: vuelve al inicio; más allá: módulo.
+        assert_eq!(t.wrap_sample_count(5000), 1000);
+        assert_eq!(t.wrap_sample_count(9000), 1000);
+        assert_eq!(t.wrap_sample_count(9500), 1500);
+    }
+
+    #[test]
+    fn invalid_region_is_identity() {
+        let mut t = test_transport();
+        t.set_loop_region_samples(5000, 5000);
+        t.set_loop_enabled(true);
+        assert!(!t.has_valid_loop());
+        assert_eq!(t.wrap_sample_count(6000), 6000);
     }
 }

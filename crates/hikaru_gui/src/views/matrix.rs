@@ -184,6 +184,9 @@ pub fn show(
     bpm: f64,
     sample_rate: u32,
     transport_sample_count: u64,
+    global_loop_enabled: bool,
+    global_loop_start_ticks: u64,
+    global_loop_end_ticks: u64,
 ) {
     ui.horizontal(|ui| {
         ui.heading("SESSION MATRIX"); // LOCO, no cambiés esto por nada en el mundo[cite: 11]
@@ -302,7 +305,19 @@ pub fn show(
         }
 
         ui.allocate_ui(Vec2::new(ui.available_width(), state.editor_height), |ui| {
-            render_clip_editor_track_view(ui, state, dragged_sample, audio_proxy, bpm, sample_rate, transport_sample_count);
+            render_clip_editor_track_view(
+                ui,
+                state,
+                dragged_sample,
+                audio_proxy,
+                bpm,
+                sample_rate,
+                transport_sample_count,
+                _ppqn,
+                global_loop_enabled,
+                global_loop_start_ticks,
+                global_loop_end_ticks,
+            );
         });
     });
 }
@@ -409,17 +424,38 @@ fn render_clip_editor_track_view(
     bpm: f64,
     sample_rate: u32,
     transport_sample_count: u64,
+    ppqn: u64,
+    global_loop_enabled: bool,
+    global_loop_start_ticks: u64,
+    global_loop_end_ticks: u64,
 ) {
     // Calculamos la posición del playhead desde el reloj del transporte (position_clock compartido)
     // en lugar de incrementar local_bar manualmente frame-a-frame.
+    // Sincronización de Loop Region global (OpenLive): si `global_loop_enabled`
+    // y la región `[start, end)` es válida, el reloj de los clips activos se
+    // reinicia en `loop_start_ticks` al alcanzar `loop_end_ticks`, igual que
+    // en la Playlist (wrap en dominio ticks -> deriva `local_bar` loopeado).
     if let Some((track_idx, scene_idx)) = state.selected_slot {
         if let Some(slot) = state.grid.get_mut(track_idx).and_then(|r| r.get_mut(scene_idx)) {
             if slot.state == SlotState::Playing {
                 let sr = sample_rate as f64;
                 if sr > 0.0 && bpm > 0.0 {
-                    let seconds = transport_sample_count as f64 / sr;
-                    let beats = seconds * (bpm / 60.0);
-                    let bars = beats / 4.0;
+                    let ppqn_safe = ppqn.max(1);
+                    let seconds_per_tick = (60.0 / bpm) / ppqn_safe as f64;
+                    let mut tick = if seconds_per_tick > 0.0 {
+                        ((transport_sample_count as f64 / sr) / seconds_per_tick).round() as u64
+                    } else {
+                        0
+                    };
+                    let loop_len = global_loop_end_ticks.saturating_sub(global_loop_start_ticks);
+                    if global_loop_enabled && loop_len > 0 {
+                        if tick >= global_loop_end_ticks {
+                            let rel_tick = tick - global_loop_start_ticks;
+                            tick = global_loop_start_ticks + (rel_tick % loop_len);
+                        }
+                    }
+                    let ticks_per_bar = ppqn_safe * 4;
+                    let bars = tick as f64 / ticks_per_bar as f64;
                     // local_bar es 1-based (1.0 = inicio del bar 1)
                     slot.clip.as_mut().unwrap().local_bar = bars as f32 + 1.0;
                     // Mantener el clip editor redibujando continuamente

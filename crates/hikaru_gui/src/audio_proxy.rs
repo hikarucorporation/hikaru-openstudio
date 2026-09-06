@@ -77,6 +77,15 @@ pub enum GuiCommand {
         loop_end_secs: f32,
         enabled: bool,
     },
+    /// Región de loop global del transporte (en SAMPLES, convertidos en la
+    /// GUI con los mismos ticks de la barra vía `ticks_to_samples`).
+    /// El engine es el dueño único del wrap (en `process()`); la GUI no
+    /// reescribe `sample_count` para loopear.
+    SetGlobalLoop {
+        start_samples: u64,
+        end_samples: u64,
+        enabled: bool,
+    },
     AddTrack,
     AddScene,
     RemoveScene { 

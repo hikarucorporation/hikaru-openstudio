@@ -270,6 +270,17 @@ fn ticks_to_px(ticks: u64, zoom_x: f32) -> f32 {
     ticks as f32 * zoom_x
 }
 
+/// Cuantiza `ticks` a la rejilla activa (`grid_ticks`).
+/// Redondeo al múltiplo más cercano: `round(ticks / grid) * grid`.
+/// Si `grid_ticks == 0` devuelve `ticks` sin modificar (snap desactivado).
+#[inline]
+pub fn snap_ticks(ticks: u64, grid_ticks: u64) -> u64 {
+    if grid_ticks == 0 {
+        return ticks;
+    }
+    ((ticks as f64 / grid_ticks as f64).round() as u64).saturating_mul(grid_ticks)
+}
+
 /// Mapeo exacto Ticks -> Píxeles con el PPQN único del motor.
 ///
 /// Fórmula canónica:
@@ -1011,6 +1022,7 @@ fn show_impl(
                                         }
                                         // Arrastrar `[`: actualiza start
                                         // manteniendo `start < end`.
+                                        // Snap to Grid: cuantiza a `snap_step_ticks`.
                                         if l_resp.dragged()
                                             && state.loop_drag_handle == LoopDragHandle::Left
                                         {
@@ -1019,8 +1031,10 @@ fn show_impl(
                                             {
                                                 let rel_x =
                                                     (pointer_pos.x - rect.min.x).max(0.0);
-                                                let mapped =
-                                                    px_to_ticks(rel_x, zoom_x);
+                                                let mapped = snap_ticks(
+                                                    px_to_ticks(rel_x, zoom_x),
+                                                    snap_step_ticks,
+                                                );
                                                 // Guarda visual mínima: 1 beat (ppqn).
                                                 let min_ticks = state.ppqn.max(1);
                                                 let other =
@@ -1039,6 +1053,7 @@ fn show_impl(
                                             }
                                         }
                                         // Arrastrar `]`: actualiza end.
+                                        // Snap to Grid: cuantiza a `snap_step_ticks`.
                                         if r_resp.dragged()
                                             && state.loop_drag_handle == LoopDragHandle::Right
                                         {
@@ -1047,8 +1062,10 @@ fn show_impl(
                                             {
                                                 let rel_x =
                                                     (pointer_pos.x - rect.min.x).max(0.0);
-                                                let mapped =
-                                                    px_to_ticks(rel_x, zoom_x);
+                                                let mapped = snap_ticks(
+                                                    px_to_ticks(rel_x, zoom_x),
+                                                    snap_step_ticks,
+                                                );
                                                 let anchor =
                                                     state.loop_preview_start_ticks;
                                                 // Guarda visual mínima: 1 beat (ppqn).
@@ -1070,12 +1087,21 @@ fn show_impl(
                                                 || state.loop_drag_handle
                                                     == LoopDragHandle::Right)
                                         {
-                                            let s = state
-                                                .loop_preview_start_ticks
-                                                .min(state.loop_preview_end_ticks);
-                                            let mut e = state
-                                                .loop_preview_start_ticks
-                                                .max(state.loop_preview_end_ticks);
+                                            // Snap to Grid en la confirmación del
+                                            // resize de corchetes: cuantiza ambos
+                                            // extremos a `snap_step_ticks`.
+                                            let s = snap_ticks(
+                                                state
+                                                    .loop_preview_start_ticks
+                                                    .min(state.loop_preview_end_ticks),
+                                                snap_step_ticks,
+                                            );
+                                            let mut e = snap_ticks(
+                                                state
+                                                    .loop_preview_start_ticks
+                                                    .max(state.loop_preview_end_ticks),
+                                                snap_step_ticks,
+                                            );
                                             // Guarda GUI previa al envío (ticks):
                                             // si end <= start, end = start + 4*ppqn;
                                             // si end-start < ppqn, end = start + ppqn.
@@ -1129,7 +1155,12 @@ fn show_impl(
                                     && ruler_response.dragged()
                                 {
                                     if let Some(pointer_pos) = ruler_response.interact_pointer_pos() {
-                                        let current_tick = px_to_ticks((pointer_pos.x - rect.min.x).max(0.0), zoom_x);
+                                        // Snap to Grid: cuantiza la posición del
+                                        // Shift+Drag a `snap_step_ticks`.
+                                        let current_tick = snap_ticks(
+                                            px_to_ticks((pointer_pos.x - rect.min.x).max(0.0), zoom_x),
+                                            snap_step_ticks,
+                                        );
 
                                         if ruler_response.drag_started() {
                                             // X inicial del drag como preview visual.
@@ -1141,7 +1172,11 @@ fn show_impl(
                                         } else if let Some(origin) = ui.input(|i| i.pointer.press_origin()) {
                                             // X inicial del drag como preview_start,
                                             // X actual del drag como preview_end.
-                                            let anchor_tick = px_to_ticks((origin.x - rect.min.x).max(0.0), zoom_x);
+                                            // Ambos cuantizados a `snap_step_ticks`.
+                                            let anchor_tick = snap_ticks(
+                                                px_to_ticks((origin.x - rect.min.x).max(0.0), zoom_x),
+                                                snap_step_ticks,
+                                            );
                                             state.loop_preview_start_ticks = anchor_tick.min(current_tick);
                                             state.loop_preview_end_ticks = anchor_tick.max(current_tick);
                                             state.loop_preview_active = true;
@@ -1184,13 +1219,27 @@ fn show_impl(
                                             let origin_rel_x = (origin.x - rect.min.x).max(0.0);
                                             let min_x = cur_rel_x.min(origin_rel_x);
                                             let max_x = cur_rel_x.max(origin_rel_x);
-                                            let start_tick = px_to_ticks(min_x, zoom_x);
-                                            let end_tick = px_to_ticks(max_x, zoom_x);
+                                            // Snap to Grid en la confirmación:
+                                            // cuantiza ambos extremos.
+                                            let start_tick = snap_ticks(
+                                                px_to_ticks(min_x, zoom_x),
+                                                snap_step_ticks,
+                                            );
+                                            let end_tick = snap_ticks(
+                                                px_to_ticks(max_x, zoom_x),
+                                                snap_step_ticks,
+                                            );
                                             (start_tick, end_tick)
                                         }
                                         _ => (
-                                            state.loop_preview_start_ticks.min(state.loop_preview_end_ticks),
-                                            state.loop_preview_start_ticks.max(state.loop_preview_end_ticks),
+                                            snap_ticks(
+                                                state.loop_preview_start_ticks.min(state.loop_preview_end_ticks),
+                                                snap_step_ticks,
+                                            ),
+                                            snap_ticks(
+                                                state.loop_preview_start_ticks.max(state.loop_preview_end_ticks),
+                                                snap_step_ticks,
+                                            ),
                                         ),
                                     };
 
