@@ -447,13 +447,30 @@ fn render_clip_editor_track_view(
                     } else {
                         0
                     };
+                    // Restricción de renderizado OpenLive: mapear `current_tick`
+                    // estrictamente dentro de `[loop_start_ticks, loop_end_ticks)`
+                    // cuando el loop global está activo, para que el playhead
+                    // (`playhead_x`) nunca se dibuje fuera de los corchetes `[`
+                    // y `]` del Time Selection. Si `current_tick` excede
+                    // `loop_end_ticks` por delay de frame, wrap visual:
+                    // `display_tick = start + ((current - start) % len)`.
                     let loop_len = global_loop_end_ticks.saturating_sub(global_loop_start_ticks);
-                    if global_loop_enabled && loop_len > 0 {
-                        if tick >= global_loop_end_ticks {
-                            let rel_tick = tick - global_loop_start_ticks;
-                            tick = global_loop_start_ticks + (rel_tick % loop_len);
-                        }
-                    }
+                    let display_tick = if global_loop_enabled
+                        && loop_len > 0
+                        && global_loop_end_ticks > global_loop_start_ticks
+                        && tick >= global_loop_start_ticks
+                        && tick >= global_loop_end_ticks
+                    {
+                        let wrapped = global_loop_start_ticks
+                            + ((tick - global_loop_start_ticks) % loop_len);
+                        // Clamp defensivo: garantiza `display_tick < loop_end`
+                        // para coincidir exactamente con la coordenada final de
+                        // la barra azul del Time Selection.
+                        wrapped.min(global_loop_end_ticks.saturating_sub(1))
+                    } else {
+                        tick
+                    };
+                    tick = display_tick;
                     let ticks_per_bar = ppqn_safe * 4;
                     let bars = tick as f64 / ticks_per_bar as f64;
                     // local_bar es 1-based (1.0 = inicio del bar 1)

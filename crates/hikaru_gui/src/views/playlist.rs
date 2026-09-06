@@ -295,6 +295,41 @@ fn ticks_to_pixel_x(ticks: u64, ppqn: u64, zoom_x: f32, playlist_offset_x: f32) 
     (ticks as f32 / ppqn) * pixels_per_beat + playlist_offset_x
 }
 
+/// Mapeo visual del playhead dentro del Time Selection cuando el loop
+/// está activo (OpenLive).
+///
+/// Si `loop_enabled` está activo y la región `[loop_start, loop_end)` es
+/// válida, mapea `current_tick` estrictamente dentro del rango para que la
+/// coordenada X nunca se dibuje fuera de los corchetes `[` y `]`.
+///
+/// Si `current_tick` excede `loop_end` por delay de renderizado de frame,
+/// aplica wrap visual:
+/// `display = loop_start + ((current - loop_start) % len)`.
+/// Si `current < loop_start` se devuelve sin modificar (el playhead aún no
+/// entró al loop: es válido mostrarlo fuera, antes del `[`).
+#[inline]
+pub fn loop_display_tick(
+    current_tick: u64,
+    loop_start_ticks: u64,
+    loop_end_ticks: u64,
+    loop_enabled: bool,
+) -> u64 {
+    if !loop_enabled {
+        return current_tick;
+    }
+    let len = loop_end_ticks.saturating_sub(loop_start_ticks);
+    if len == 0 || loop_end_ticks <= loop_start_ticks {
+        return current_tick;
+    }
+    if current_tick < loop_start_ticks {
+        return current_tick;
+    }
+    if current_tick >= loop_end_ticks {
+        return loop_start_ticks + ((current_tick - loop_start_ticks) % len);
+    }
+    current_tick
+}
+
 /// Samples -> ticks con el BPM activo y el Sample Rate real del motor.
 /// Inversa exacta de `ticks_to_samples_precise`.
 #[inline]
@@ -1676,8 +1711,21 @@ fn show_impl(
 
                             // Renderizado del Playhead con la fórmula canónica:
                             // pixel_x = (ticks / ppqn) * pixels_per_beat + offset.
-                            let playhead_x = ticks_to_pixel_x(
+                            // Restricción visual OpenLive: cuando `loop_enabled`
+                            // está activo, `display_tick` se mapea estrictamente
+                            // dentro de `[loop_start_ticks, loop_end_ticks)` para
+                            // que `playhead_x` nunca se dibuje fuera de los
+                            // corchetes `[` y `]`. Coincide exactamente con las
+                            // coordenadas inicial/final de la barra azul del
+                            // Time Selection (mismos ticks -> mismos px).
+                            let display_tick = loop_display_tick(
                                 state.playhead_tick,
+                                state.loop_start_ticks,
+                                state.loop_end_ticks,
+                                loop_enabled && state.loop_region_active,
+                            );
+                            let playhead_x = ticks_to_pixel_x(
+                                display_tick,
                                 ppqn,
                                 zoom_x,
                                 rect.min.x,
