@@ -1,4 +1,4 @@
-use hikaru_gui::HikaruGui;
+use hikaru_gui::HikaruApp;
 
 #[test]
 fn test_gui_state_initialization() {

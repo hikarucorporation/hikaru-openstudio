@@ -40,10 +40,9 @@ pub fn show(
     playlist_state: &PlaylistState,
     audio_proxy: &AudioProxy,
 ) {
-    // Si el engine está en PLAYING, la GUI LEE la posición real de la placa de sonido:
-    if transport.playback_state == TransportPlaybackState::Playing {
-        transport.sample_count = position_clock.load(Ordering::Relaxed);
-    }
+    // Siempre leer la posición real del reloj del engine para que el
+    // timecode y el playhead se actualicen tanto en OpenStudio como en OpenLive.
+    transport.sample_count = position_clock.load(Ordering::Relaxed);
 
     // 1. CALCULAMOS LA BARRA ACTUAL CON EL RELEVO REAL DEL AUDIO
     let samples_per_beat = (transport.sample_rate.get() as f64 * 60.0) / transport.bpm;
@@ -148,6 +147,9 @@ pub fn show(
                 }
 
                 // BOTÓN LOOP (🔁)
+                // Estado solo en GUI (`is_looping`); la guarda ppqn previa al
+                // envío vive en playlist.rs/app.rs. No se escribe campo alguno
+                // en el transporte/DSP desde aquí (anti-congelamiento).
                 let loop_bg = if *is_looping { Color32::from_rgb(0, 180, 220) } else { Color32::from_gray(45) };
                 let loop_txt = if *is_looping { Color32::BLACK } else { Color32::WHITE };
                 if ui.add_sized(btn_size, Button::new(RichText::new("🔁").size(14.0).color(loop_txt)).fill(loop_bg)).clicked() {

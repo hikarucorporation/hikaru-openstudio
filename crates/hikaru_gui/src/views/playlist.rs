@@ -4,7 +4,7 @@
  */
 
 use egui::{
-    Ui, RichText, Color32, ScrollArea, Frame, Stroke, Vec2, Rect, Pos2, 
+    Ui, RichText, Color32, ScrollArea, Frame, Stroke, Vec2, Rect, Pos2,
     Sense, Align2, PointerButton, CursorIcon
 };
 use std::f32::consts::PI;
@@ -69,6 +69,14 @@ pub struct PlaylistClip {
     pub color: Color32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LoopDragHandle {
+    None,
+    Left,
+    Right,
+    Body,
+}
+
 #[derive(Clone, Debug)]
 pub struct PlaylistState {
     pub clips: Vec<(usize, PlaylistClip)>,
@@ -82,6 +90,28 @@ pub struct PlaylistState {
     pub selected_clips: Vec<usize>,
     pub clipboard: Vec<(usize, PlaylistClip)>,
     pub needs_full_sync: bool, // Bandera para resincronización maestra
+    /// Inicio de la región de loop en ticks.
+    pub loop_start_ticks: u64,
+    /// Fin de la región de loop en ticks.
+    pub loop_end_ticks: u64,
+    /// Si hay una selección de loop activa.
+    pub loop_region_active: bool,
+    /// Estado temporal para dibujar la región mientras se arrastra.
+    pub loop_dragging: bool,
+    /// Región visual (translúcida) mientras dura el Shift+Drag.
+    /// PATRÓN MATRIX: durante `.dragged()` SOLO se toca este estado
+    /// visual; `loop_start_ticks` / `loop_end_ticks` (los que lee el
+    /// transporte global / engine) SOLO se confirman en `drag_stopped()`.
+    /// Así se evita notificar al engine en cada frame (congelamiento).
+    pub loop_preview_start_ticks: u64,
+    pub loop_preview_end_ticks: u64,
+    pub loop_preview_active: bool,
+    /// Drag handle activo (Left, Right, o Body para mover todo).
+    pub loop_drag_handle: LoopDragHandle,
+    /// Se activa en el frame en que termina un drag de loop para evitar limpiar selección.
+    /// El consumidor (matrix.rs / transporte global) propaga al engine
+    /// ÚNICAMENTE cuando esta bandera está activa (`drag_stopped`).
+    pub loop_drag_completed_this_frame: bool,
 }
 
 impl Default for PlaylistState {
@@ -98,11 +128,114 @@ impl Default for PlaylistState {
             selected_clips: Vec::new(),
             clipboard: Vec::new(),
             needs_full_sync: true,
+            loop_start_ticks: 0,
+            loop_end_ticks: 0,
+            loop_region_active: false,
+            loop_dragging: false,
+            loop_preview_start_ticks: 0,
+            loop_preview_end_ticks: 0,
+            loop_preview_active: false,
+            loop_drag_handle: LoopDragHandle::None,
+            loop_drag_completed_this_frame: false,
         }
     }
 }
 
 impl PlaylistState {
+    /// Longitud de la región de loop en ticks (0 si es inválida).
+    pub fn loop_length_ticks(&self) -> u64 {
+        self.loop_end_ticks.saturating_sub(self.loop_start_ticks)
+    }
+
+    /// Indica si la región de loop es válida para enviar al transporte.
+    /// Guarda GUI: `end > start` (el saneado previo garantiza además
+    /// `len >= ppqn`, 1 beat).
+    pub fn is_loop_region_valid(&self) -> bool {
+        self.loop_region_active && self.loop_end_ticks > self.loop_start_ticks
+    }
+
+    /// Final del último clip en la Playlist en ticks (0 si no hay clips).
+    /// Estilo REAPER: el loop por defecto abarca hasta el final del proyecto.
+    pub fn total_project_ticks(&self) -> u64 {
+        self.clips
+            .iter()
+            .map(|(_, c)| c.start_tick.saturating_add(c.duration_ticks))
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Guarda GUI previa al envío al transporte (anti-congelamiento).
+    /// Antes de `transport.set_loop_region(start, end)` /
+    /// `set_loop_enabled(true)`:
+    /// - si `end <= start`, fuerza `end = start + (4 * ppqn)`;
+    /// - si `end - start < ppqn`, fuerza `end = start + ppqn`.
+    /// Solo con `end > start` se considera válida para enviar.
+    pub fn sanitize_loop_region(&mut self) {
+        let ppqn = self.ppqn.max(1);
+        let start = self.loop_start_ticks;
+        let mut end = self.loop_end_ticks;
+        if end <= start {
+            end = start.saturating_add(4u64.saturating_mul(ppqn));
+        }
+        if end.saturating_sub(start) < ppqn {
+            end = start.saturating_add(ppqn);
+        }
+        self.loop_start_ticks = start;
+        self.loop_end_ticks = end;
+        if self.loop_end_ticks > self.loop_start_ticks {
+            self.loop_region_active = true;
+        }
+    }
+
+    /// Guarda de auto-selección estilo REAPER para el transporte GLOBAL.
+    /// Debe llamarse ANTES de notificar al transporte
+    /// (`transport.set_loop_region(start, end)` +
+    /// `transport.set_loop_enabled(true)`).
+    /// Guarda GUI previa al envío:
+    /// - si `end <= start`, `end = start + (4 * ppqn)` (o `0..fin_proyecto`
+    ///   con mínimo de 1 compás si no hay selección válida);
+    /// - si `end - start < ppqn`, `end = start + ppqn`;
+    /// - SOLO se confirma si `end > start`.
+    /// Solo debe llamarse en modo Arranger; no toca el estado visual de drag
+    /// mientras hay un arrastre en curso.
+    pub fn ensure_minimum_global_loop(&mut self, loop_enabled: bool) {
+        if !loop_enabled || self.loop_dragging {
+            return;
+        }
+        let ppqn = self.ppqn.max(1);
+        let len = self.loop_end_ticks.saturating_sub(self.loop_start_ticks);
+        let needs_init = !self.loop_region_active
+            || self.loop_end_ticks <= self.loop_start_ticks
+            || len < ppqn;
+        if needs_init {
+            // REAPER: sin selección válida -> todo el proyecto desde el tick 0.
+            let total = self.total_project_ticks();
+            let start = 0u64;
+            // Guarda previa al envío: mínimo 4 beats si no hay clips.
+            let mut end = total.max(4u64.saturating_mul(ppqn));
+            // Verifica el rango en ticks: si end <= start, end = start + 4*ppqn.
+            if end <= start {
+                end = start.saturating_add(4u64.saturating_mul(ppqn));
+            }
+            // Si end - start < ppqn, fuerza end = start + ppqn.
+            if end.saturating_sub(start) < ppqn {
+                end = start.saturating_add(ppqn);
+            }
+            // SOLO confirma si la región es válida (end > start).
+            if end > start {
+                self.loop_start_ticks = start;
+                self.loop_end_ticks = end;
+                self.loop_preview_start_ticks = start;
+                self.loop_preview_end_ticks = end;
+                self.loop_region_active = true;
+                self.loop_drag_completed_this_frame = true;
+            }
+        } else {
+            // Región ya existente: aplicar la misma guarda por seguridad.
+            self.sanitize_loop_region();
+        }
+    }
+
     /// Resincroniza todos los clips del timeline con el motor de audio de forma atómica.
     pub fn sync_all_clips_to_engine(&mut self, audio_proxy: &AudioProxy, bpm: f64) {
         for (track_id, clip) in &self.clips {
@@ -300,10 +433,11 @@ pub fn show(
     audio_proxy: &AudioProxy,
     bpm: f64,
     sample_rate: u32,
+    loop_enabled: bool,
 ) {
     show_impl(
         ui, state, tracks, current_bar, dragged_sample, audio_proxy, bpm, sample_rate,
-        ViewMode::Arranger,
+        ViewMode::Arranger, loop_enabled,
     );
 }
 
@@ -318,9 +452,13 @@ pub fn show_embedded(
     sample_rate: u32,
     title: &str,
 ) {
+    // En modo OPENLIVE / ClipEditor el Shift+Drag sobre la regla define el
+    // loop individual del clip (`clip.loop_start` / `clip.loop_end` via
+    // `state.loop_start_ticks` / `state.loop_end_ticks`), independiente del
+    // transporte global. Se habilita siempre (true).
     show_impl(
         ui, state, tracks, local_bar, dragged_sample, audio_proxy, bpm, sample_rate,
-        ViewMode::ClipEditor { title },
+        ViewMode::ClipEditor { title }, true,
     );
 }
 
@@ -334,6 +472,7 @@ fn show_impl(
     bpm: f64,
     sample_rate: u32,
     mode: ViewMode,
+    loop_enabled: bool,
 ) {
     // Sincronización completa automática si es requerida al arrancar o cambiar vista
     if mode.drives_engine() && state.needs_full_sync {
@@ -354,6 +493,18 @@ fn show_impl(
 
     let ctrl = ui.input(|i| i.modifiers.ctrl || i.modifiers.command);
     let shift = ui.input(|i| i.modifiers.shift);
+
+    state.loop_drag_completed_this_frame = false;
+
+    // Guarda de distancia mínima para el transporte GLOBAL (Playlist /
+    // Arranger): si el botón de loop está ENCENDIDO pero la región
+    // confirmada es degenerada (`loop_start == loop_end`), forzar al menos
+    // 1 compás (1 beat/bar) para que `loop_end` nunca quede pegado a
+    // `loop_start`. No se aplica durante el drag ni en ClipEditor
+    // (el loop individual lo gestiona matrix.rs al hacer `drag_stopped`).
+    if mode.drives_engine() {
+        state.ensure_minimum_global_loop(loop_enabled);
+    }
 
     let ppqn = state.ppqn;
 
@@ -615,7 +766,7 @@ fn show_impl(
                                 Sense::click_and_drag()
                             );
 
-                            if response.clicked_by(PointerButton::Primary) && !shift {
+                            if response.clicked_by(PointerButton::Primary) && !shift && !state.loop_drag_completed_this_frame {
                                 state.selected_clips.clear();
                             }
 
@@ -653,6 +804,9 @@ fn show_impl(
                                 Stroke::new(1.0_f32, Color32::from_gray(60))
                             );
 
+                            let ruler_id = ui.make_persistent_id("timeline_ruler");
+                            let ruler_response = ui.interact(ruler_rect, ruler_id, Sense::click_and_drag());
+
                             let snap_step_ticks = (state.ppqn * 4 * state.grid_numerator as u64) / state.grid_denominator as u64;
                             let step_width = ticks_to_px(snap_step_ticks, zoom_x);
                             let total_grid_steps = (canvas_width / step_width.max(1.0)).ceil() as usize;
@@ -681,6 +835,419 @@ fn show_impl(
                                         format!("{}", bar_num),
                                         egui::FontId::monospace(10.0),
                                         Color32::from_gray(180)
+                                    );
+                                }
+                            }
+
+                            // --- LOOP REGION RENDERING & INTERACTION ---
+                            // Shift + Drag sobre la regla define la región de loop.
+                            // En Arranger solo cuando el botón de loop del transporte
+                            // está ENCENDIDO; en ClipEditor (OPENLIVE) siempre, para
+                            // el loop individual del clip.
+                            // PATRÓN MATRIX (anti-congelamiento): durante `.dragged()`
+                            // SOLO se actualiza el rectángulo translúcido visual
+                            // (`loop_preview_*`), SIN tocar `loop_start_ticks` /
+                            // `loop_end_ticks` ni notificar al engine. La región
+                            // confirmada SOLO se escribe en `drag_stopped()` y el
+                            // consumidor propaga al motor vía
+                            // `loop_drag_completed_this_frame`.
+                            {
+                                let shift_pressed = ui.input(|i| i.modifiers.shift);
+                                let allow_loop_select = loop_enabled
+                                    || matches!(mode, ViewMode::ClipEditor { .. });
+
+                                // --- RESIZE DE EXTREMOS ESTILO REAPER ---
+                                // Hitboxes de ~6px en cada borde para arrastrar
+                                // `[` (loop_start) y `]` (loop_end) de forma
+                                // independiente. Se crean ANTES del Shift+Drag
+                                // para poder darle prioridad al resize.
+                                // PATRÓN MATRIX: durante `.dragged()` solo se
+                                // toca el preview visual; la confirmación al
+                                // transporte es SOLO en `drag_stopped()`.
+                                let bracket_hit_w = 12.0_f32; // ~±6px
+                                let mut left_bracket_resp: Option<egui::Response> = None;
+                                let mut right_bracket_resp: Option<egui::Response> = None;
+                                // Base para hitboxes: región confirmada (en
+                                // reposo) o preview si ya hay resize en curso.
+                                let bracket_base = if state.loop_dragging
+                                    && state.loop_preview_active
+                                    && (state.loop_drag_handle == LoopDragHandle::Left
+                                        || state.loop_drag_handle == LoopDragHandle::Right)
+                                {
+                                    if state.loop_preview_end_ticks > state.loop_preview_start_ticks {
+                                        Some((
+                                            state.loop_preview_start_ticks,
+                                            state.loop_preview_end_ticks,
+                                        ))
+                                    } else {
+                                        None
+                                    }
+                                } else if state.loop_region_active
+                                    && state.loop_end_ticks > state.loop_start_ticks
+                                {
+                                    Some((state.loop_start_ticks, state.loop_end_ticks))
+                                } else {
+                                    None
+                                };
+                                if let Some((b_start, b_end)) = bracket_base {
+                                    if !shift_pressed {
+                                        let start_x =
+                                            rect.min.x + ticks_to_px(b_start, zoom_x);
+                                        let end_x =
+                                            rect.min.x + ticks_to_px(b_end, zoom_x);
+                                        let (min_x, max_x) = if start_x <= end_x {
+                                            (start_x, end_x)
+                                        } else {
+                                            (end_x, start_x)
+                                        };
+                                        let ruler_center_y = ruler_rect.center().y;
+                                        let left_hit = Rect::from_center_size(
+                                            Pos2::new(min_x, ruler_center_y),
+                                            Vec2::new(bracket_hit_w, ruler_rect.height()),
+                                        );
+                                        let right_hit = Rect::from_center_size(
+                                            Pos2::new(max_x, ruler_center_y),
+                                            Vec2::new(bracket_hit_w, ruler_rect.height()),
+                                        );
+                                        let left_id = ui.make_persistent_id("loop_bracket_left");
+                                        let right_id =
+                                            ui.make_persistent_id("loop_bracket_right");
+                                        let l_resp =
+                                            ui.interact(left_hit, left_id, Sense::drag());
+                                        let r_resp =
+                                            ui.interact(right_hit, right_id, Sense::drag());
+                                        if l_resp.hovered() || l_resp.dragged() {
+                                            ui.output_mut(|o| {
+                                                o.cursor_icon = CursorIcon::ResizeHorizontal
+                                            });
+                                        }
+                                        if r_resp.hovered() || r_resp.dragged() {
+                                            ui.output_mut(|o| {
+                                                o.cursor_icon = CursorIcon::ResizeHorizontal
+                                            });
+                                        }
+                                        // Iniciar resize: sembrar preview desde
+                                        // la región confirmada.
+                                        if l_resp.drag_started() {
+                                            state.loop_preview_start_ticks =
+                                                state.loop_start_ticks;
+                                            state.loop_preview_end_ticks =
+                                                state.loop_end_ticks;
+                                            state.loop_preview_active = true;
+                                            state.loop_dragging = true;
+                                            state.loop_drag_handle = LoopDragHandle::Left;
+                                        }
+                                        if r_resp.drag_started() {
+                                            state.loop_preview_start_ticks =
+                                                state.loop_start_ticks;
+                                            state.loop_preview_end_ticks =
+                                                state.loop_end_ticks;
+                                            state.loop_preview_active = true;
+                                            state.loop_dragging = true;
+                                            state.loop_drag_handle = LoopDragHandle::Right;
+                                        }
+                                        // Arrastrar `[`: actualiza start
+                                        // manteniendo `start < end`.
+                                        if l_resp.dragged()
+                                            && state.loop_drag_handle == LoopDragHandle::Left
+                                        {
+                                            if let Some(pointer_pos) =
+                                                l_resp.interact_pointer_pos()
+                                            {
+                                                let rel_x =
+                                                    (pointer_pos.x - rect.min.x).max(0.0);
+                                                let mapped =
+                                                    px_to_ticks(rel_x, zoom_x);
+                                                // Guarda visual mínima: 1 beat (ppqn).
+                                                let min_ticks = state.ppqn.max(1);
+                                                let other =
+                                                    state.loop_preview_end_ticks.max(
+                                                        state.loop_end_ticks.max(
+                                                            min_ticks.saturating_add(1),
+                                                        ),
+                                                    );
+                                                let max_start = other
+                                                    .saturating_sub(min_ticks);
+                                                state.loop_preview_start_ticks =
+                                                    mapped.min(max_start);
+                                                state.loop_preview_end_ticks = other;
+                                                state.loop_preview_active = true;
+                                                state.loop_dragging = true;
+                                            }
+                                        }
+                                        // Arrastrar `]`: actualiza end.
+                                        if r_resp.dragged()
+                                            && state.loop_drag_handle == LoopDragHandle::Right
+                                        {
+                                            if let Some(pointer_pos) =
+                                                r_resp.interact_pointer_pos()
+                                            {
+                                                let rel_x =
+                                                    (pointer_pos.x - rect.min.x).max(0.0);
+                                                let mapped =
+                                                    px_to_ticks(rel_x, zoom_x);
+                                                let anchor =
+                                                    state.loop_preview_start_ticks;
+                                                // Guarda visual mínima: 1 beat (ppqn).
+                                                let min_end = anchor.saturating_add(
+                                                    state.ppqn.max(1),
+                                                );
+                                                state.loop_preview_end_ticks =
+                                                    mapped.max(min_end);
+                                                state.loop_preview_active = true;
+                                                state.loop_dragging = true;
+                                            }
+                                        }
+                                        // Confirmar resize al soltar.
+                                        let left_stopped = l_resp.drag_stopped();
+                                        let right_stopped = r_resp.drag_stopped();
+                                        if (left_stopped || right_stopped)
+                                            && (state.loop_drag_handle
+                                                == LoopDragHandle::Left
+                                                || state.loop_drag_handle
+                                                    == LoopDragHandle::Right)
+                                        {
+                                            let s = state
+                                                .loop_preview_start_ticks
+                                                .min(state.loop_preview_end_ticks);
+                                            let mut e = state
+                                                .loop_preview_start_ticks
+                                                .max(state.loop_preview_end_ticks);
+                                            // Guarda GUI previa al envío (ticks):
+                                            // si end <= start, end = start + 4*ppqn;
+                                            // si end-start < ppqn, end = start + ppqn.
+                                            let ppqn_r = state.ppqn.max(1);
+                                            if e <= s {
+                                                e = s.saturating_add(
+                                                    4u64.saturating_mul(ppqn_r),
+                                                );
+                                            }
+                                            if e.saturating_sub(s) < ppqn_r {
+                                                e = s.saturating_add(ppqn_r);
+                                            }
+                                            // SOLO confirma si end > start.
+                                            if e > s {
+                                                state.loop_start_ticks = s;
+                                                state.loop_end_ticks = e;
+                                                state.loop_region_active = true;
+                                            }
+                                            state.sanitize_loop_region();
+                                            state.loop_preview_start_ticks = s;
+                                            state.loop_preview_end_ticks =
+                                                state.loop_end_ticks;
+                                            state.loop_preview_active = false;
+                                            state.loop_dragging = false;
+                                            state.loop_drag_handle = LoopDragHandle::None;
+                                            state.loop_drag_completed_this_frame = true;
+                                        }
+                                        left_bracket_resp = Some(l_resp);
+                                        right_bracket_resp = Some(r_resp);
+                                    }
+                                }
+                                let bracket_drag_active = left_bracket_resp
+                                    .as_ref()
+                                    .map(|r| r.dragged())
+                                    .unwrap_or(false)
+                                    || right_bracket_resp
+                                        .as_ref()
+                                        .map(|r| r.dragged())
+                                        .unwrap_or(false)
+                                    || state.loop_drag_handle == LoopDragHandle::Left
+                                    || state.loop_drag_handle == LoopDragHandle::Right;
+
+                                // 2. Capturar arrastre Shift + Drag sobre la regla.
+                                // Crea una selección nueva completa de punta a
+                                // punta. SOLO estado visual: no tocar ticks del
+                                // transporte. Se omite si hay resize de
+                                // corchetes en curso (prioridad al resize).
+                                if allow_loop_select
+                                    && shift_pressed
+                                    && !bracket_drag_active
+                                    && ruler_response.dragged()
+                                {
+                                    if let Some(pointer_pos) = ruler_response.interact_pointer_pos() {
+                                        let current_tick = px_to_ticks((pointer_pos.x - rect.min.x).max(0.0), zoom_x);
+
+                                        if ruler_response.drag_started() {
+                                            // X inicial del drag como preview visual.
+                                            state.loop_preview_start_ticks = current_tick;
+                                            state.loop_preview_end_ticks = current_tick;
+                                            state.loop_preview_active = true;
+                                            state.loop_dragging = true;
+                                            state.loop_drag_handle = LoopDragHandle::Body;
+                                        } else if let Some(origin) = ui.input(|i| i.pointer.press_origin()) {
+                                            // X inicial del drag como preview_start,
+                                            // X actual del drag como preview_end.
+                                            let anchor_tick = px_to_ticks((origin.x - rect.min.x).max(0.0), zoom_x);
+                                            state.loop_preview_start_ticks = anchor_tick.min(current_tick);
+                                            state.loop_preview_end_ticks = anchor_tick.max(current_tick);
+                                            state.loop_preview_active = true;
+                                            state.loop_dragging = true;
+                                            if state.loop_drag_handle != LoopDragHandle::Body {
+                                                state.loop_drag_handle = LoopDragHandle::Body;
+                                            }
+                                        } else if current_tick >= state.loop_preview_start_ticks {
+                                            state.loop_preview_end_ticks = current_tick;
+                                            state.loop_preview_active = true;
+                                            state.loop_dragging = true;
+                                        } else {
+                                            state.loop_preview_start_ticks = current_tick;
+                                            state.loop_preview_active = true;
+                                            state.loop_dragging = true;
+                                        }
+                                    }
+                                }
+
+                                // Confirmación del Shift+Drag (selección nueva de
+                                // punta a punta). No interfiere con el resize de
+                                // corchetes (Left/Right ya se confirmó arriba).
+                                if ruler_response.drag_stopped()
+                                    && state.loop_dragging
+                                    && state.loop_drag_handle != LoopDragHandle::Left
+                                    && state.loop_drag_handle != LoopDragHandle::Right
+                                {
+                                    // Re-mapear las X finales del drag a ticks
+                                    // con la fórmula del zoom activo. Fuente de
+                                    // verdad: posición actual + origen del press.
+                                    // Si no hay puntero disponible (soltado fuera
+                                    // de la regla), se usa el preview visual.
+                                    let (mapped_start, mapped_end) = match (
+                                        ruler_response.interact_pointer_pos()
+                                            .or_else(|| ui.input(|i| i.pointer.hover_pos())),
+                                        ui.input(|i| i.pointer.press_origin()),
+                                    ) {
+                                        (Some(pointer_pos), Some(origin)) => {
+                                            let cur_rel_x = (pointer_pos.x - rect.min.x).max(0.0);
+                                            let origin_rel_x = (origin.x - rect.min.x).max(0.0);
+                                            let min_x = cur_rel_x.min(origin_rel_x);
+                                            let max_x = cur_rel_x.max(origin_rel_x);
+                                            let start_tick = px_to_ticks(min_x, zoom_x);
+                                            let end_tick = px_to_ticks(max_x, zoom_x);
+                                            (start_tick, end_tick)
+                                        }
+                                        _ => (
+                                            state.loop_preview_start_ticks.min(state.loop_preview_end_ticks),
+                                            state.loop_preview_start_ticks.max(state.loop_preview_end_ticks),
+                                        ),
+                                    };
+
+                                    let mut start_tick = mapped_start.min(mapped_end);
+                                    let mut end_tick = mapped_start.max(mapped_end);
+
+                                    // Guarda GUI previa al envío (ticks):
+                                    // si end <= start, end = start + (4 * ppqn);
+                                    // si end - start < ppqn, end = start + ppqn.
+                                    // Solo se confirma al transporte global si
+                                    // end_tick > start_tick.
+                                    let ppqn_s = state.ppqn.max(1);
+                                    if end_tick <= start_tick {
+                                        end_tick = start_tick.saturating_add(
+                                            4u64.saturating_mul(ppqn_s),
+                                        );
+                                    }
+                                    if end_tick.saturating_sub(start_tick) < ppqn_s {
+                                        end_tick = start_tick.saturating_add(ppqn_s);
+                                    }
+
+                                    state.loop_dragging = false;
+                                    state.loop_preview_active = false;
+                                    // Confirmar preview -> región confirmada.
+                                    state.loop_start_ticks = start_tick;
+                                    state.loop_end_ticks = end_tick;
+                                    state.loop_region_active = true;
+                                    // Garantiza ventana válida mínima (1/16): si
+                                    // `loop_end <= loop_start` o la diferencia es
+                                    // menor al mínimo, extiende automáticamente.
+                                    // Evita rebotes infinitos dentro del mismo
+                                    // buffer de audio (congelamiento).
+                                    state.sanitize_loop_region();
+                                    // Refuerzo extra con la misma guarda: si la
+                                    // ventana quedó menor a 1 beat (ppqn),
+                                    // extender a 1 beat.
+                                    if state.loop_end_ticks
+                                        < state.loop_start_ticks.saturating_add(ppqn_s)
+                                    {
+                                        state.loop_end_ticks = state
+                                            .loop_start_ticks
+                                            .saturating_add(ppqn_s);
+                                    }
+                                    start_tick = state.loop_start_ticks;
+                                    end_tick = state.loop_end_ticks;
+                                    // El transporte global se actualiza fuera de
+                                    // aquí (app.rs al ver
+                                    // `loop_drag_completed_this_frame`):
+                                    // equivalente a
+                                    // `transport.set_loop_region(start_tick, end_tick)`
+                                    // + `transport.set_loop_enabled(true)`.
+                                    // Sincronizar preview con la región saneada.
+                                    state.loop_preview_start_ticks = start_tick;
+                                    state.loop_preview_end_ticks = end_tick;
+                                    state.loop_drag_handle = LoopDragHandle::None;
+                                    state.loop_drag_completed_this_frame = true;
+                                }
+
+                                // 3. Renderizar corchetes estilo REAPER y región
+                                // translúcida. Durante el drag se dibuja el
+                                // preview visual; en reposo, la región
+                                // confirmada. render_start/render_end SOLO
+                                // alimentan el rectángulo visual (ticks -> px).
+                                let (render_active, render_start, render_end) = if state.loop_dragging && state.loop_preview_active {
+                                    (true, state.loop_preview_start_ticks, state.loop_preview_end_ticks)
+                                } else {
+                                    (state.loop_region_active, state.loop_start_ticks, state.loop_end_ticks)
+                                };
+                                if render_active && render_end > render_start {
+                                    let start_x = rect.min.x + ticks_to_px(render_start, zoom_x);
+                                    let end_x = rect.min.x + ticks_to_px(render_end, zoom_x);
+                                    let (min_x, max_x) = if start_x <= end_x { (start_x, end_x) } else { (end_x, start_x) };
+                                    let selection_rect = egui::Rect::from_min_max(
+                                        egui::pos2(min_x, ruler_rect.min.y),
+                                        egui::pos2(max_x, ruler_rect.max.y),
+                                    );
+
+                                    // Fondo translúcido
+                                    painter.rect_filled(
+                                        selection_rect,
+                                        0.0,
+                                        egui::Color32::from_rgba_unmultiplied(100, 200, 255, 40),
+                                    );
+
+                                    // Corchete de apertura `[` en loop_start y
+                                    // de cierre `]` en loop_end, estilo REAPER,
+                                    // con egui::Stroke / painter.line().
+                                    let bracket_color = egui::Color32::LIGHT_BLUE;
+                                    let bracket_stroke =
+                                        egui::Stroke::new(2.0_f32, bracket_color);
+                                    let tick_len = 6.0_f32;
+                                    let top_y = ruler_rect.min.y + 1.0;
+                                    let bottom_y = ruler_rect.max.y - 1.0;
+                                    // `[`: vertical + pestañas superiores /
+                                    // inferiores hacia dentro (derecha).
+                                    painter.line_segment(
+                                        [egui::pos2(min_x, top_y), egui::pos2(min_x, bottom_y)],
+                                        bracket_stroke,
+                                    );
+                                    painter.line_segment(
+                                        [egui::pos2(min_x, top_y), egui::pos2(min_x + tick_len, top_y)],
+                                        bracket_stroke,
+                                    );
+                                    painter.line_segment(
+                                        [egui::pos2(min_x, bottom_y), egui::pos2(min_x + tick_len, bottom_y)],
+                                        bracket_stroke,
+                                    );
+                                    // `]`: vertical + pestañas hacia dentro
+                                    // (izquierda).
+                                    painter.line_segment(
+                                        [egui::pos2(max_x, top_y), egui::pos2(max_x, bottom_y)],
+                                        bracket_stroke,
+                                    );
+                                    painter.line_segment(
+                                        [egui::pos2(max_x, top_y), egui::pos2(max_x - tick_len, top_y)],
+                                        bracket_stroke,
+                                    );
+                                    painter.line_segment(
+                                        [egui::pos2(max_x, bottom_y), egui::pos2(max_x - tick_len, bottom_y)],
+                                        bracket_stroke,
                                     );
                                 }
                             }
@@ -1003,7 +1570,8 @@ fn show_impl(
                             );
 
                             // Interacción de SEEK / PLAYHEAD
-                            if response.dragged() || response.clicked() {
+                            // No hacer seek mientras se define loop con Shift + Drag.
+                            if (response.dragged() || response.clicked()) && !shift {
                                 if let Some(pointer_pos) = response.interact_pointer_pos() {
                                     let rel_x = (pointer_pos.x - rect.min.x).max(0.0);
                                     let clicked_ticks = px_to_ticks(rel_x, zoom_x);

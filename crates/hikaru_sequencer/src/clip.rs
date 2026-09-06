@@ -40,6 +40,12 @@ pub struct Clip {
     pub trigger_mode: TriggerMode,
     pub start_sample: u64,    // Cuándo empezó a sonar realmente
     pub loop_enabled: bool,
+    /// Punto de loop inicial del clip individual (en samples).
+    /// Independiente del transporte global.
+    pub loop_start: u64,
+    /// Punto de loop final del clip individual (en samples).
+    /// Si `loop_end <= loop_start`, el clip loopea completo.
+    pub loop_end: u64,
 }
 
 impl Clip {
@@ -51,7 +57,26 @@ impl Clip {
             trigger_mode: TriggerMode::Trigger,
             start_sample: 0,
             loop_enabled: true,
+            loop_start: 0,
+            loop_end: 0,
         }
+    }
+
+    /// Establece los puntos de loop del clip individual garantizando
+    /// una ventana válida mínima (si `end <= start`, loopea completo).
+    pub fn set_loop_points(&mut self, start: u64, end: u64) {
+        if end <= start {
+            self.loop_start = 0;
+            self.loop_end = 0;
+        } else {
+            self.loop_start = start;
+            self.loop_end = end;
+        }
+    }
+
+    /// Indica si el clip tiene una región de loop individual válida.
+    pub fn has_valid_clip_loop(&self) -> bool {
+        self.loop_enabled && self.loop_end > self.loop_start
     }
 
     pub fn get_state(&self) -> ClipState {

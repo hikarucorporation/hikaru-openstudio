@@ -64,9 +64,18 @@ pub enum GuiCommand {
     TriggerScene { 
         scene_idx: usize 
     },
-    TriggerClip { 
-        track_idx: usize, 
-        scene_idx: usize 
+    TriggerClip {
+        track_idx: usize,
+        scene_idx: usize
+    },
+    /// Puntos de loop del clip individual (Session Matrix / OPENLIVE),
+    /// independientes del transporte global.
+    SetClipLoop {
+        track_idx: usize,
+        scene_idx: usize,
+        loop_start_secs: f32,
+        loop_end_secs: f32,
+        enabled: bool,
     },
     AddTrack,
     AddScene,

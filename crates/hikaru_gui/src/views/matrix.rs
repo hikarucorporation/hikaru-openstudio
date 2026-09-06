@@ -29,6 +29,26 @@ pub struct MatrixClip {
     pub local_state: PlaylistState,
     pub local_track: Track,
     pub local_bar: f32,
+    /// Punto de loop inicial del clip individual (en ticks).
+    /// Lo determina el loopeo visual de la regla (Shift+Drag) sobre el
+    /// clip seleccionado. Independiente del transporte global.
+    pub loop_start: u64,
+    /// Punto de loop final del clip individual (en ticks).
+    pub loop_end: u64,
+    /// Si el loop individual del clip está habilitado.
+    pub loop_enabled: bool,
+}
+
+impl MatrixClip {
+    /// Longitud del loop individual en ticks (0 si es inválido).
+    pub fn loop_length_ticks(&self) -> u64 {
+        self.loop_end.saturating_sub(self.loop_start)
+    }
+
+    /// Indica si el clip tiene región de loop individual válida.
+    pub fn has_valid_clip_loop(&self) -> bool {
+        self.loop_enabled && self.loop_end > self.loop_start
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -163,6 +183,7 @@ pub fn show(
     _ppqn: u64,
     bpm: f64,
     sample_rate: u32,
+    transport_sample_count: u64,
 ) {
     ui.horizontal(|ui| {
         ui.heading("SESSION MATRIX"); // LOCO, no cambiés esto por nada en el mundo[cite: 11]
@@ -192,6 +213,13 @@ pub fn show(
             });
         });
     });
+
+    // Si hay algún clip sonando en la matriz, mantener la UI actualizando
+    let any_clip_playing = state.grid.iter().flatten()
+        .any(|slot| slot.state == SlotState::Playing);
+    if any_clip_playing {
+        ui.ctx().request_repaint();
+    }
 
     ui.add_space(6.0);
 
@@ -274,7 +302,7 @@ pub fn show(
         }
 
         ui.allocate_ui(Vec2::new(ui.available_width(), state.editor_height), |ui| {
-            render_clip_editor_track_view(ui, state, dragged_sample, audio_proxy, bpm, sample_rate);
+            render_clip_editor_track_view(ui, state, dragged_sample, audio_proxy, bpm, sample_rate, transport_sample_count);
         });
     });
 }
@@ -380,17 +408,23 @@ fn render_clip_editor_track_view(
     audio_proxy: &AudioProxy,
     bpm: f64,
     sample_rate: u32,
+    transport_sample_count: u64,
 ) {
-    // Si hay un clip seleccionado y el motor está reproduciendo, actualizamos la aguja (playhead)
+    // Calculamos la posición del playhead desde el reloj del transporte (position_clock compartido)
+    // en lugar de incrementar local_bar manualmente frame-a-frame.
     if let Some((track_idx, scene_idx)) = state.selected_slot {
         if let Some(slot) = state.grid.get_mut(track_idx).and_then(|r| r.get_mut(scene_idx)) {
             if slot.state == SlotState::Playing {
-                // Calculamos la posición en base al BPM
-                let samples_per_beat = (sample_rate as f64 * 60.0) / bpm;
-                let samples_per_bar = samples_per_beat * 4.0;
-                
-                // Avanzamos el cursor local
-                slot.clip.as_mut().unwrap().local_bar += (1.0 / samples_per_bar) as f32;
+                let sr = sample_rate as f64;
+                if sr > 0.0 && bpm > 0.0 {
+                    let seconds = transport_sample_count as f64 / sr;
+                    let beats = seconds * (bpm / 60.0);
+                    let bars = beats / 4.0;
+                    // local_bar es 1-based (1.0 = inicio del bar 1)
+                    slot.clip.as_mut().unwrap().local_bar = bars as f32 + 1.0;
+                    // Mantener el clip editor redibujando continuamente
+                    ui.ctx().request_repaint();
+                }
             }
         }
     }
@@ -433,6 +467,9 @@ fn render_clip_editor_track_view(
             let clip = state.grid[track_idx][scene_idx].clip.as_mut().unwrap();
             let mut local_tracks = vec![clip.local_track.clone()];
 
+            // Mismo handler de dibujado y selección de rango con Shift+Drag
+            // que el Arranger: la regla del Clip Track Editor define el loop
+            // individual del clip seleccionado.
             playlist::show_embedded(
                 ui,
                 &mut clip.local_state,
@@ -447,6 +484,52 @@ fn render_clip_editor_track_view(
 
             if let Some(updated_track) = local_tracks.into_iter().next() {
                 clip.local_track = updated_track;
+            }
+
+            // El loopeo visual de la regla determina los puntos de loop del
+            // clip actual (`clip.loop_start` / `clip.loop_end`), permitiendo
+            // que el clip individual loopee de forma independiente al
+            // transporte global.
+            // Los límites se envían al engine ÚNICAMENTE al terminar el
+            // arrastre (`drag_stopped`, vía
+            // `loop_drag_completed_this_frame`), nunca en cada frame de
+            // renderizado GUI (evita SetClipLoop continuo).
+            {
+                // Solo propagar al engine cuando terminó el drag.
+                if clip.local_state.loop_drag_completed_this_frame {
+                    let ppqn = clip.local_state.ppqn.max(1) as f64;
+                    let (new_start, new_end, new_enabled) = if clip.local_state.is_loop_region_valid() {
+                        (
+                            clip.local_state.loop_start_ticks,
+                            clip.local_state.loop_end_ticks,
+                            true,
+                        )
+                    } else {
+                        (clip.loop_start, clip.loop_end, false)
+                    };
+
+                if new_start != clip.loop_start
+                    || new_end != clip.loop_end
+                    || new_enabled != clip.loop_enabled
+                {
+                    clip.loop_start = new_start;
+                    clip.loop_end = new_end;
+                    clip.loop_enabled = new_enabled;
+
+                    let seconds_per_tick = if bpm > 0.0 {
+                        (60.0 / bpm) / ppqn
+                    } else {
+                        0.0
+                    };
+                    audio_proxy.send(GuiCommand::SetClipLoop {
+                        track_idx,
+                        scene_idx,
+                        loop_start_secs: (new_start as f64 * seconds_per_tick) as f32,
+                        loop_end_secs: (new_end as f64 * seconds_per_tick) as f32,
+                        enabled: new_enabled,
+                    });
+                }
+                }
             }
         });
 }
@@ -496,6 +579,9 @@ fn load_clip_into_slot(
             local_state,
             local_track: Track::new(0, name, false),
             local_bar: 1.0,
+            loop_start: 0,
+            loop_end: 0,
+            loop_enabled: false,
         }),
     };
 
