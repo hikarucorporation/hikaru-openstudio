@@ -18,7 +18,7 @@
 
 ## Vista Previa
 
-![Hikaru OpenStudio UI Preview](assets/Captura%20de%20pantalla_20260907_010615.png)
+![Hikaru OpenStudio UI Preview](assets/screenshots/preview.png)
 
 *Session Matrix disparando escenas, File Explorer integrado con preview de samples, Clip Track Editor y Mixer Rack con vúmetros en tiempo real.*
 
