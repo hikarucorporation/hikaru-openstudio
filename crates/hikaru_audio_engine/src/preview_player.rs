@@ -118,6 +118,29 @@ impl PreviewPlayer {
                 break;
             }
         }
+
+        // ── DIAGNÓSTICO TEMPORAL: una sola vez por reproducción ──
+        // Muestra las primeras muestras escritas para confirmar que
+        // el buffer contiene audio real (no ceros) y la ganancia es > 0.
+        // Temporary: eliminar después de debug.
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static DIAG_SENT: AtomicBool = AtomicBool::new(false);
+        if !DIAG_SENT.swap(true, Ordering::Relaxed) {
+            let written = output.len().min(16);
+            let first_samples: Vec<f32> = output[..written].iter().copied().collect();
+            let buf_end = written.min(self.length);
+            let buf_first: Vec<f32> = self.buffer[..buf_end].iter().copied().collect();
+            eprintln!(
+                "[AUDIO DIAG] preview_player.process() called: pos={}, active_len={}, vol={:.2}, output_len={}",
+                self.position, active_len, vol, output.len()
+            );
+            eprintln!(
+                "[AUDIO DIAG]   buffer[:16] = {:?}", buf_first
+            );
+            eprintln!(
+                "[AUDIO DIAG]   output[:16] = {:?}", first_samples
+            );
+        }
     }
 }
 

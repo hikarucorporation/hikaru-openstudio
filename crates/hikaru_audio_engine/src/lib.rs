@@ -463,12 +463,10 @@ impl<'a> AudioEngine<'a> {
     }
 
     pub fn play(&mut self) {
-        // FUGA #1 (preview -> Master Mixer): al darle Play al transporte
-        // global el preview del explorer DEBE detenerse y silenciarse de
-        // inmediato. `stop()` limpia buffer/posición/flag para que ni un
-        // resto del buffer se mezcle durante la reproducción del timeline.
-        // El gate en `process()` (preview solo cuando NO se está en Playing)
-        // es la segunda barrera anti-fuga.
+        // Anti-fuga: detener el preview del explorer al arrancar el
+        // transporte. El preview NO suena en process() cuando el flag
+        // is_playing baja acá. Si un PreviewSample tardío (mpsc) llega
+        // después, suena hasta que el usuario lo frena o clickea Play.
         self.preview_player.stop();
         self.transport.playback_state = TransportPlaybackState::Playing;
     }
@@ -615,137 +613,97 @@ impl<'a> AudioEngine<'a> {
         // El `continue` de las voces terminadas deja este 0.0 intacto.
         samples.fill(0.0);
 
-        // FUGA #1: el preview del explorer NUNCA se mezcla con el Master
-        // Mixer durante la reproducción del timeline. Solo suena cuando el
-        // transporte NO está en Playing (Stopped/Paused para pre-escucha).
-        // En Playing el `play()` ya hizo `stop()`, y este gate impide que
-        // un `PreviewSample` tardío (mpsc) contamine el mix. Si igual llegó
-        // tarde, se descarta (stop) para que no quede encolado al frenar el
-        // timeline.
-        if self.transport.playback_state != TransportPlaybackState::Playing {
-            // Procesar preview incluso si el transport está detenido
-            self.preview_player.process(samples);
-            let peak = samples.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
-            let peak = if peak.is_finite() { peak } else { 0.0 };
-            self.output_level_bits.store(peak.to_bits(), Ordering::Relaxed);
-            self.position_clock.store(self.transport.sample_count, Ordering::Relaxed);
-            return;
-        }
-        if self.preview_player.is_playing() {
-            self.preview_player.stop();
-        }
+        // ── PREVIEW: SIEMPRE se mezcla si está activo ──
+        // El preview del explorador suena SIEMPRE, con o sin transporte
+        // corriendo. La anti-fuga se gestiona en `play()` (stop del
+        // preview) y en el command handler (StopPreview antes de Play).
+        self.preview_player.process(samples);
 
-        let buffer_frames = (samples.len() / num_channels) as u64;
-        if buffer_frames == 0 {
-            self.output_level_bits.store(0.0f32.to_bits(), Ordering::Relaxed);
-            return;
-        }
-        let frame_start = self.transport.sample_count;
-        let frame_end = frame_start + buffer_frames;
-        // Reloj lineal de voces (sin wrap): base de `voice_frame_linear`.
-        let abs_start = self.absolute_frame;
-        // Copia local: el wrap es función pura del transporte.
-        let transport = self.transport;
-        let mode = self.mode;
+        // ── CLIP MIXING: solo cuando el transporte reproduce ──
+        if self.transport.playback_state == TransportPlaybackState::Playing {
+            let buffer_frames = (samples.len() / num_channels) as u64;
+            if buffer_frames == 0 {
+                self.output_level_bits.store(0.0f32.to_bits(), Ordering::Relaxed);
+                return;
+            }
+            let frame_start = self.transport.sample_count;
+            let frame_end = frame_start + buffer_frames;
+            let abs_start = self.absolute_frame;
+            let transport = self.transport;
+            let mode = self.mode;
 
-        // MEZCLA MULTIPISTA
-        // El wrap del loop global se aplica ACÁ, en el callback de audio,
-        // frame a frame vía `transport.wrap_sample_count` (dueño único).
-        // Así engine y GUI (que deriva el playhead del `position_clock`)
-        // ven exactamente el mismo reloj, sin Seek espurios desde la GUI.
-        //
-        // CATEGÓRICO (bug compás 5→7): sin loop de clip activo y pasado
-        // el final, la voz retorna 0.0 y se duerme (`is_playing = false` /
-        // `VoiceState::Finished`). Jamás `elapsed % len`.
-        for clip in self.clips.iter_mut() {
-            if mode == EngineMode::OpenStudio {
-                let clip_frame_end = clip.start_frame.saturating_add(clip.duration_frames);
-                let offset_frames = clip.sample_offset / clip.channels.max(1);
-                for f in 0..buffer_frames as usize {
-                    let global_frame = transport.wrap_sample_count(frame_start + f as u64);
-                    if global_frame < clip.start_frame || global_frame >= clip_frame_end {
-                        // Transporte en área sin datos → silencio (0.0 ya
-                        // presente por el fill). Sin lectura, sin módulo.
-                        continue;
-                    }
-                    let relative_frame = (global_frame - clip.start_frame) as usize;
-                    let src_frame = offset_frames.saturating_add(relative_frame);
-                    // Corte categórico: pasado el natural → 0.0, sin OOB.
-                    let l = clip.read_sample(src_frame);
-                    if l == 0.0 {
-                        // `read_sample` ya devolvió silencio (OOB o no
-                        // finito): no sumar nada, voz terminada en este
-                        // frame. El 0.0 del fill queda intacto.
-                        // Chequear también R para no dejar medio frame.
-                        let r = clip.read_sample_r(src_frame);
-                        if r == 0.0 {
+            for clip in self.clips.iter_mut() {
+                if mode == EngineMode::OpenStudio {
+                    let clip_frame_end = clip.start_frame.saturating_add(clip.duration_frames);
+                    let offset_frames = clip.sample_offset / clip.channels.max(1);
+                    for f in 0..buffer_frames as usize {
+                        let global_frame = transport.wrap_sample_count(frame_start + f as u64);
+                        if global_frame < clip.start_frame || global_frame >= clip_frame_end {
                             continue;
                         }
-                        let out_r_idx = f * num_channels + 1;
-                        samples[out_r_idx] += r;
-                        continue;
-                    }
-                    let r = clip.read_sample_r(src_frame);
-                    let out_l_idx = f * num_channels;
-                    let out_r_idx = out_l_idx + 1;
-                    samples[out_l_idx] += l;
-                    samples[out_r_idx] += r;
-                }
-            } else {
-                if !clip.is_playing {
-                    continue;
-                }
-
-                // Voz OpenLive sobre reloj LINEAL (`absolute_frame`):
-                // REGLA DEL CLIP MANDA — solo `clip_loop_enabled == true`
-                // loopea. El Time Selection (loop global) mueve el cursor
-                // pero NUNCA re-emite ni extiende la voz: con el cursor
-                // loopeando en una región más corta que el clip, el
-                // `elapsed` lineal igual supera la emisión y la voz muta a
-                // (0.0, 0.0) en los compases 10..15 y se duerme
-                // (`is_playing = false`). Jamás `elapsed % len` global.
-                let offset_frames = clip.sample_offset / clip.channels.max(1);
-                let emission = clip.emission_len_frames();
-                let mut clip_finished = false;
-                for f in 0..buffer_frames as usize {
-                    let abs = abs_start + f as u64;
-
-                    // ── HARD-STOP irrefutable ──────────────────────────
-                    // Si no hay loop de clip Y el frame lineal ya pasó el
-                    // final de la emisión → silencio inmediato + break.
-                    // NO se procesa interpolate, NO se lee buffer, NO se
-                    // evalúa condición alguna. El fill(0.0) del bloque ya
-                    // garantiza ceros; solo cortamos la iteración.
-                    if !clip.has_valid_clip_loop() && abs >= clip.start_absolute {
-                        let elapsed = abs - clip.start_absolute;
-                        if elapsed >= emission {
-                            clip_finished = true;
-                            break;
+                        let relative_frame = (global_frame - clip.start_frame) as usize;
+                        let src_frame = offset_frames.saturating_add(relative_frame);
+                        let l = clip.read_sample(src_frame);
+                        if l == 0.0 {
+                            let r = clip.read_sample_r(src_frame);
+                            if r == 0.0 {
+                                continue;
+                            }
+                            let out_r_idx = f * num_channels + 1;
+                            samples[out_r_idx] += r;
+                            continue;
                         }
+                        let r = clip.read_sample_r(src_frame);
+                        let out_l_idx = f * num_channels;
+                        let out_r_idx = out_l_idx + 1;
+                        samples[out_l_idx] += l;
+                        samples[out_r_idx] += r;
                     }
-
-                    let Some(relative_frame) = clip.voice_frame_linear(abs) else {
-                        continue;
-                    };
-
-                    let src_frame = offset_frames.saturating_add(relative_frame);
-                    let l = clip.read_sample(src_frame);
-                    let r = clip.read_sample_r(src_frame);
-                    if l == 0.0 && r == 0.0 {
+                } else {
+                    if !clip.is_playing {
                         continue;
                     }
-                    let out_l_idx = f * num_channels;
-                    let out_r_idx = out_l_idx + 1;
-                    samples[out_l_idx] += l;
-                    samples[out_r_idx] += r;
-                }
-                if clip_finished {
-                    clip.is_playing = false;
+
+                    let offset_frames = clip.sample_offset / clip.channels.max(1);
+                    let emission = clip.emission_len_frames();
+                    let mut clip_finished = false;
+                    for f in 0..buffer_frames as usize {
+                        let abs = abs_start + f as u64;
+
+                        if !clip.has_valid_clip_loop() && abs >= clip.start_absolute {
+                            let elapsed = abs - clip.start_absolute;
+                            if elapsed > 0 && elapsed >= emission {
+                                clip_finished = true;
+                                break;
+                            }
+                        }
+
+                        let Some(relative_frame) = clip.voice_frame_linear(abs) else {
+                            continue;
+                        };
+
+                        let src_frame = offset_frames.saturating_add(relative_frame);
+                        let l = clip.read_sample(src_frame);
+                        let r = clip.read_sample_r(src_frame);
+                        if l == 0.0 && r == 0.0 {
+                            continue;
+                        }
+                        let out_l_idx = f * num_channels;
+                        let out_r_idx = out_l_idx + 1;
+                        samples[out_l_idx] += l;
+                        samples[out_r_idx] += r;
+                    }
+                    if clip_finished {
+                        clip.is_playing = false;
+                    }
                 }
             }
+
+            self.transport.sample_count = self.transport.wrap_sample_count(frame_end);
+            self.absolute_frame = self.absolute_frame.saturating_add(buffer_frames);
         }
 
-        // Pico real del bloque para el vúmetro: 0.0 == -inf dB.
+        // Pico real del bloque (preview + clips) para el vúmetro.
         let mut peak = 0.0f32;
         for &s in samples.iter() {
             if s.is_finite() {
@@ -756,13 +714,6 @@ impl<'a> AudioEngine<'a> {
             }
         }
         self.output_level_bits.store(peak.to_bits(), Ordering::Relaxed);
-
-        // Avance con wrap: el cursor (GUI vía `position_clock`) coincide
-        // con la región mezclada en OpenStudio; en OpenLive las voces
-        // viven en el reloj lineal (`absolute_frame`, sin wrap) para que
-        // el Time Selection jamás las re-emita.
-        self.transport.sample_count = self.transport.wrap_sample_count(frame_end);
-        self.absolute_frame = self.absolute_frame.saturating_add(buffer_frames);
         self.position_clock.store(self.transport.sample_count, Ordering::Relaxed);
     }
 }
@@ -910,25 +861,24 @@ mod tests {
     }
 
     #[test]
-    fn process_in_playing_never_mixes_preview() {
-        // FUGA #1: aunque un PreviewSample tardío llegue tras el Play, el
-        // gate en process() impide la mezcla: sin clips, el bloque queda en
-        // silencio absoluto y el vúmetro cae a 0.0 (-inf dB).
+    fn process_in_playing_always_mixes_preview() {
+        // El preview del explorer SIEMPRE suena en el Master Bus, incluso
+        // si el transporte está en Playing. La anti-fuga se gestiona en
+        // `play()` (stop del preview) y en el command handler (StopPreview
+        // antes de Play). Un PreviewSample tardío DESPUÉS del Play sí se
+        // mezcla: el usuario pidió pre-escuchar mientras el timeline corre.
         let mut engine = test_engine();
         engine.preview_player.play(vec![0.5f32; 4096]);
         engine.play();
         // Simular PreviewSample tardío (mpsc) DESPUÉS del Play.
         engine.preview_player.play(vec![0.5f32; 4096]);
         assert!(engine.preview_player.is_playing());
-        let mut raw = vec![0.777f32; 512 * 2];
+        let mut raw = vec![0.0f32; 512 * 2];
         let mut buf = AudioBuffer::new(&mut raw);
         engine.process(&mut buf);
         let peak = raw.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
-        assert_eq!(peak, 0.0, "preview fugado al Master Mixer durante Playing");
-        assert_eq!(engine.output_peak(), 0.0);
-        assert_eq!(engine.output_db(), f32::NEG_INFINITY);
-        // El preview tardío se descarta, no queda encolado.
-        assert!(!engine.preview_player.is_playing());
+        assert!(peak > 0.0, "preview must always mix into Master Bus");
+        assert!(engine.output_peak() > 0.0);
     }
 
     #[test]

@@ -12,4 +12,4 @@ hikaru_transport = { path = "../hikaru_transport" }
 egui = "0.27.0"
 eframe = { version = "0.27.0", features = ["glow"] }
 hound = "3.5"
-cpal = "0.18.2"
+cpal = { version = "0.18.2", features = ["pulseaudio"] }

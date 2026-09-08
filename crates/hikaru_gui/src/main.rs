@@ -142,8 +142,16 @@ fn main() -> Result<(), eframe::Error> {
                                 raw_samples
                             };
 
+                            let sample_count = final_samples.len();
                             engine.preview_player.set_volume(volume);
                             engine.preview_player.play(final_samples);
+                            // ── DIAGNÓSTICO TEMPORAL ──
+                            eprintln!(
+                                "[AUDIO DIAG] PreviewSample loaded: {} samples, vol={:.2}, transport={:?}, preview_playing={}",
+                                sample_count, volume,
+                                engine.transport.playback_state,
+                                engine.preview_player.is_playing()
+                            );
                         }
                     } else {
                         eprintln!("[Hikaru Engine Error] No se pudo abrir el archivo WAV: {}", path);
@@ -151,6 +159,11 @@ fn main() -> Result<(), eframe::Error> {
                 }
                 GuiCommand::StopPreview => {
                     if let Ok(mut engine) = engine_for_commands.lock() {
+                        // ── DIAGNÓSTICO TEMPORAL ──
+                        eprintln!(
+                            "[AUDIO DIAG] StopPreview called, preview_was_playing={}",
+                            engine.preview_player.is_playing()
+                        );
                         // Corte categórico: stop() limpia buffer/posición/flag.
                         // `play(Vec::new())` dejaba la semántica ambigua.
                         engine.preview_player.stop();
@@ -299,42 +312,74 @@ fn main() -> Result<(), eframe::Error> {
 fn init_cpal_stream(
     engine: Arc<Mutex<hikaru_audio_engine::AudioEngine<'static>>>,
 ) -> Result<cpal::Stream, Box<dyn std::error::Error>> {
-    let host = cpal::default_host();
+    // ── 1. Seleccionar host PulseAudio explícitamente ──
+    // cpal::default_host() puede caer en ALSA directo en PipeWire,
+    // provocando que la placa ignore las muestras.
+    // PulseAudio es el backend que PipeWire emula, así que es el
+    // que registra la app como "sink-input" en `pactl`.
+    let hosts = cpal::available_hosts();
+    println!("[Hikaru] Hosts disponibles: {:?}", hosts);
+
+    let host = cpal::host_from_id(cpal::HostId::PulseAudio)
+        .unwrap_or_else(|_| cpal::default_host());
+
+    println!("[Hikaru] Host de audio: {}", host.id());
+
+    // ── 1. Enumerar dispositivos de salida ──
+    // El default de PipeWire/ALSA puede ser un sink dummy, HDMI
+    // desconectado, o un monitor. Iteramos para encontrar la placa real.
+    let devices: Vec<_> = host
+        .output_devices()?
+        .collect();
+
+    println!("[Hikaru] Dispositivos de salida encontrados: {}", devices.len());
+    for (i, d) in devices.iter().enumerate() {
+        println!("  [{}] {}", i, d);
+    }
+
+    // Seleccionar el default; si es el único, usarlo directo.
+    // Si hay varios, preferir el default pero loguear la lista.
     let device = host
         .default_output_device()
         .ok_or("No se encontró dispositivo de salida de audio")?;
 
+    println!("[Hikaru] Dispositivo SELECCIONADO: {}", device);
+
+    // ── 2. Configuración del dispositivo ──
     let supported_config = device.default_output_config()?;
-    let mut stream_config: cpal::StreamConfig = supported_config.into();
+    let device_format = supported_config.sample_format();
+    let device_channels = supported_config.channels();
+    let device_sr = supported_config.sample_rate();
 
-    stream_config.buffer_size = cpal::BufferSize::Fixed(2048);
+    println!(
+        "[Hikaru] Config del dispositivo: format={:?}, channels={}, sr={}, buffer={:?}",
+        device_format, device_channels, device_sr,
+        supported_config.buffer_size()
+    );
 
-    let hardware_sr = stream_config.sample_rate as f32;
-    println!("[Hikaru] Hardware SR detectado: {}Hz", hardware_sr);
+    // Usar EXACTAMENTE la config soportada por el dispositivo.
+    // No forzar SR ni buffer — el dispositivo sabe cuál es correcto.
+    let stream_config: cpal::StreamConfig = supported_config.into();
+
+    let hardware_sr = device_sr as f32;
+    println!("[Hikaru] Hardware SR para engine: {}Hz", hardware_sr);
 
     if let Ok(mut lock) = engine.lock() {
         lock.set_sample_rate(hardware_sr);
     }
 
+    // ── 3. Construir el stream ──
+    let engine_cb = engine.clone();
     let stream = device.build_output_stream(
         stream_config,
         move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-            // FIX audio fantasma: si el try_lock() falla por contención
-            // GUI/hilo-audio, el buffer NO debe quedar con muestras previas
-            // en RAM (la tarjeta las repetiría como bucle infinito aunque el
-            // clip ya terminó en el compás 5). Garantía absoluta:
-            // 1) pre-limpieza antes de intentar el lock, así NINGÚN retorno
-            //    deja basura no procesada;
-            // 2) rama Err re-afirma silencio explícito.
-            // Resultado en fallo de lock: SILENCIO ABSOLUTO (0.0 / -inf dB).
             data.fill(0.0);
-            match engine.try_lock() {
+            match engine_cb.try_lock() {
                 Ok(mut lock) => {
                     let mut buffer = hikaru_core::AudioBuffer { samples: data };
                     lock.process(&mut buffer);
                 }
                 Err(_) => {
-                    // Lock ocupado (GUI decodificando, etc.): mantener ceros.
                     data.fill(0.0);
                 }
             }
@@ -342,13 +387,15 @@ fn init_cpal_stream(
         |err| {
             let err_str = err.to_string();
             if !err_str.contains("underrun") && !err_str.contains("overrun") {
-                eprintln!("Error en stream de CPAL: {}", err);
+                eprintln!("[Hikaru Error] CPAL stream error: {}", err);
             }
         },
         None,
     )?;
 
     stream.play()?;
+    println!("[Hikaru] Stream CPAL: play() OK — {}", device);
+
     Ok(stream)
 }
 
