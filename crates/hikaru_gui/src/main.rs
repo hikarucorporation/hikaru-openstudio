@@ -115,57 +115,45 @@ fn main() -> Result<(), eframe::Error> {
                     }
                 }
                 GuiCommand::PreviewSample { path, volume, speed: _ } => {
-                    println!("[Hikaru Engine] Cargando preview: {}", path);
+                    // Detener preview anterior inmediatamente.
+                    if let Ok(mut engine) = engine_for_commands.lock() {
+                        engine.preview_player.stop();
+                        engine.preview_player.set_volume(volume);
+                    }
 
-                    if let Ok(mut reader) = hound::WavReader::open(&path) {
-                        let spec = reader.spec();
-                        let file_sr = spec.sample_rate as f32;
-                        let channels = spec.channels as usize;
-
-                        let raw_samples: Vec<f32> = match spec.sample_format {
-                            hound::SampleFormat::Float => reader.samples::<f32>().filter_map(Result::ok).collect(),
-                            hound::SampleFormat::Int => {
-                                let max_val = (1 << (spec.bits_per_sample - 1)) as f32;
-                                reader.samples::<i32>()
-                                    .filter_map(Result::ok)
-                                    .map(|s| s as f32 / max_val)
-                                    .collect()
+                    // Decodificar WAV en hilo background y cargar directamente
+                    // en el PreviewBuffer compartido (sin pasar por el channel).
+                    let engine_clone = engine_for_commands.clone();
+                    std::thread::spawn(move || {
+                        let decoded = match decode_wav(&path) {
+                            Ok(d) => d,
+                            Err(e) => {
+                                eprintln!("[Hikaru Engine Error] decode failed for {}: {}", path, e);
+                                return;
                             }
                         };
 
-                        if let Ok(mut engine) = engine_for_commands.lock() {
-                            let target_sr = engine.sample_rate;
+                        let channels = decoded.channels;
+                        let target_sr = engine_clone
+                            .lock()
+                            .map(|e| e.sample_rate)
+                            .unwrap_or(44100.0);
 
-                            let final_samples = if (file_sr - target_sr).abs() > 1.0 {
-                                resample_linear(&raw_samples, channels, file_sr, target_sr)
-                            } else {
-                                raw_samples
-                            };
+                        let final_samples = if (decoded.file_sr - target_sr).abs() > 1.0 {
+                            resample_linear(&decoded.samples, decoded.channels, decoded.file_sr, target_sr)
+                        } else {
+                            decoded.samples
+                        };
 
-                            let sample_count = final_samples.len();
-                            engine.preview_player.set_volume(volume);
-                            engine.preview_player.play(final_samples);
-                            // ── DIAGNÓSTICO TEMPORAL ──
-                            eprintln!(
-                                "[AUDIO DIAG] PreviewSample loaded: {} samples, vol={:.2}, transport={:?}, preview_playing={}",
-                                sample_count, volume,
-                                engine.transport.playback_state,
-                                engine.preview_player.is_playing()
-                            );
+                        // Load directamente en el engine — sin pasar por el channel.
+                        // Esto evita el delay del mpsc y la ventana de silencio.
+                        if let Ok(mut engine) = engine_clone.lock() {
+                            engine.preview_player.play(final_samples, channels);
                         }
-                    } else {
-                        eprintln!("[Hikaru Engine Error] No se pudo abrir el archivo WAV: {}", path);
-                    }
+                    });
                 }
                 GuiCommand::StopPreview => {
                     if let Ok(mut engine) = engine_for_commands.lock() {
-                        // ── DIAGNÓSTICO TEMPORAL ──
-                        eprintln!(
-                            "[AUDIO DIAG] StopPreview called, preview_was_playing={}",
-                            engine.preview_player.is_playing()
-                        );
-                        // Corte categórico: stop() limpia buffer/posición/flag.
-                        // `play(Vec::new())` dejaba la semántica ambigua.
                         engine.preview_player.stop();
                     }
                 }
@@ -357,9 +345,14 @@ fn init_cpal_stream(
         supported_config.buffer_size()
     );
 
-    // Usar EXACTAMENTE la config soportada por el dispositivo.
-    // No forzar SR ni buffer — el dispositivo sabe cuál es correcto.
-    let stream_config: cpal::StreamConfig = supported_config.into();
+    // Usar la config del dispositivo pero FORZAR buffer bajo para baja latencia.
+    // 1024 frames @ 48kHz ≈ 21ms: suficiente margen para el hilo de decode
+    // sin underruns, pero bajo enough para preview responsivo.
+    let stream_config = cpal::StreamConfig {
+        channels: supported_config.channels(),
+        sample_rate: supported_config.sample_rate(),
+        buffer_size: cpal::BufferSize::Fixed(1024),
+    };
 
     let hardware_sr = device_sr as f32;
     println!("[Hikaru] Hardware SR para engine: {}Hz", hardware_sr);
@@ -399,27 +392,56 @@ fn init_cpal_stream(
     Ok(stream)
 }
 
+struct WavData {
+    samples: Vec<f32>,
+    file_sr: f32,
+    channels: usize,
+}
+
+fn decode_wav(path: &str) -> Result<WavData, Box<dyn std::error::Error>> {
+    let mut reader = hound::WavReader::open(path)?;
+    let spec = reader.spec();
+    let file_sr = spec.sample_rate as f32;
+    let channels = spec.channels as usize;
+
+    let samples: Vec<f32> = match spec.sample_format {
+        hound::SampleFormat::Float => reader.samples::<f32>().filter_map(Result::ok).collect(),
+        hound::SampleFormat::Int => {
+            let max_val = (1 << (spec.bits_per_sample - 1)) as f32;
+            reader
+                .samples::<i32>()
+                .filter_map(Result::ok)
+                .map(|s| s as f32 / max_val)
+                .collect()
+        }
+    };
+
+    Ok(WavData { samples, file_sr, channels })
+}
+
+/// Resampling lineal channel-aware. Procesa frame-by-frame para que la
+/// interpolación nunca cruce canales (L↔R), preservando la imagen estéreo.
 fn resample_linear(samples: &[f32], channels: usize, from_sr: f32, to_sr: f32) -> Vec<f32> {
     if samples.is_empty() || channels == 0 {
         return Vec::new();
     }
 
-    let ratio = from_sr / to_sr;
+    let channels = channels.max(1);
     let input_frames = samples.len() / channels;
+    let ratio = from_sr / to_sr;
     let output_frames = ((input_frames as f32) / ratio) as usize;
     let mut output = Vec::with_capacity(output_frames * channels);
 
     for frame in 0..output_frames {
-        let input_index = frame as f32 * ratio;
-        let index_floor = input_index.floor() as usize;
-        let index_ceil = (index_floor + 1).min(input_frames - 1);
-        let t = input_index - index_floor as f32;
+        let input_pos = frame as f32 * ratio;
+        let idx0 = input_pos.floor() as usize;
+        let idx1 = (idx0 + 1).min(input_frames.saturating_sub(1));
+        let t = input_pos - idx0 as f32;
 
         for ch in 0..channels {
-            let s1 = samples[index_floor * channels + ch];
-            let s2 = samples[index_ceil * channels + ch];
-            let interpolated = s1 + t * (s2 - s1);
-            output.push(interpolated);
+            let s0 = samples[idx0 * channels + ch];
+            let s1 = samples[idx1 * channels + ch];
+            output.push(s0 + t * (s1 - s0));
         }
     }
 

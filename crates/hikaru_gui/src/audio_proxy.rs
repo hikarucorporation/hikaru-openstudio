@@ -111,10 +111,10 @@ pub enum GuiCommand {
         solo: bool 
     },
     RemoveTrack(usize),
-    PreviewSample { 
-        path: String, 
-        volume: f32, 
-        speed: f32, 
+    PreviewSample {
+        path: String,
+        volume: f32,
+        speed: f32,
     },
     StopPreview,
     SetPreviewVolume(f32),

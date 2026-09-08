@@ -1,204 +1,384 @@
 // crates/hikaru_audio_engine/src/preview_player.rs
-// Reproductor de vista previa de muestras — motor de audio en tiempo real.
-// Cero bloqueos, cero alocaciones en el callback de CPAL.
+// Reproductor de preview lock-free para el callback de CPAL.
+//
+// Arquitectura:
+//   - `PreviewBuffer` se comparte vía `Arc` entre el command handler (writer)
+//     y el callback de CPAL (reader).
+//   - El callback avanza un `AtomicUsize` cursor y lee del buffer — cero allocs.
+//   - Los campos no atómicos (`data`, `channels`, `length`) se escriben bajo
+//     el engine Mutex y se leen bajo el engine Mutex (via `try_lock`), así que
+//     `UnsafeCell` es seguro aquí (misma garantía que `Cell` pero sin `Copy`).
+//   - Un `generation: AtomicU64` previene que un decode viejo sobreescriba uno nuevo.
 
-/// Capacidad máxima de muestras mono para preview (aprox. 5 min @ 48kHz).
-/// Se usa para pre-alocar el buffer interno y evitar realocaciones dinámicas
-/// durante la reproducción.
-const MAX_PREVIEW_SAMPLES: usize = 14_400_000;
+use std::cell::UnsafeCell;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU32, AtomicUsize, Ordering};
+use std::sync::Arc;
 
-/// Estado del reproductor de preview.
+/// Buffer de preview compartido entre command handler y CPAL callback.
 ///
-/// Este struct vive dentro del callback de audio de CPAL. Por eso:
-/// - No usa Mutex/RwLock.
-/// - No aloca memoria en `process()`.
-/// - El buffer se reemplaza entero en `play()` (evento de control, no callback).
-pub struct PreviewPlayer {
-    /// Buffer interno de muestras mono f32 pre-alocadas.
-    /// Se trunca o reemplaza en `play()`, nunca se redimensiona en `process()`.
-    buffer: Vec<f32>,
-    /// Longitud válida cargada en `play()` (<= MAX_PREVIEW_SAMPLES).
-    /// `process()` muteará/frenará al alcanzar este límite, no al final del
-    /// buffer pre-alocado (que contiene ceros de relleno).
-    length: usize,
-    /// Índice de la muestra actual en reproducción.
-    position: usize,
-    /// Factor de ganancia lineal: 0.0 = silencio absoluto, 1.0 = volumen máximo.
-    volume: f32,
-    /// Flag de reproducción activa. Se levanta en `play()` y baja en `stop()` o al finalizar el buffer.
-    is_playing: bool,
+/// **Writer** (command handler / decode thread): llama `start()` o `stop()`
+/// mientras sostiene el engine Mutex.
+///
+/// **Reader** (CPAL callback): avanza `cursor` con `fetch_add` y lee samples.
+/// El engine Mutex es non-blocking (`try_lock`); si está ocupado → silencio.
+pub struct PreviewBuffer {
+    /// Samples interleaved (mono o stereo), escritos bajo engine Mutex.
+    data: UnsafeCell<Vec<f32>>,
+    /// Cantidad de canales (1 = mono, 2 = stereo).
+    channels: UnsafeCell<usize>,
+    /// Cantidad válida de samples en `data`.
+    length: UnsafeCell<usize>,
+    /// Cursor de lectura — avanzado por el CPAL callback con `fetch_add`.
+    pub cursor: AtomicUsize,
+    /// Ganancia lineal [0.0, 1.0] — almacenada como bits de f32.
+    pub volume_bits: AtomicU32,
+    /// Flag de reproducción activa.
+    pub is_playing: AtomicBool,
+    /// Generación: previene que decodes viejos sobreescriban nuevos.
+    pub generation: AtomicU64,
 }
 
-impl PreviewPlayer {
-    /// Crea un `PreviewPlayer` con buffer pre-alocado y volumen por defecto al 80%.
-    pub fn new() -> Self {
-        let mut buffer = Vec::with_capacity(MAX_PREVIEW_SAMPLES);
-        buffer.resize(MAX_PREVIEW_SAMPLES, 0.0);
+// Safe: `data`/`channels`/`length` solo se escriben bajo engine Mutex
+// y se leen bajo engine Mutex (try_lock en CPAL callback).
+unsafe impl Send for PreviewBuffer {}
+unsafe impl Sync for PreviewBuffer {}
 
+impl PreviewBuffer {
+    fn new() -> Self {
         Self {
-            buffer,
-            length: 0,
-            position: 0,
-            volume: 0.8,
-            is_playing: false,
+            data: UnsafeCell::new(Vec::new()),
+            channels: UnsafeCell::new(1),
+            length: UnsafeCell::new(0),
+            cursor: AtomicUsize::new(0),
+            volume_bits: AtomicU32::new(0.8f32.to_bits()),
+            is_playing: AtomicBool::new(false),
+            generation: AtomicU64::new(0),
         }
     }
 
-    /// Establece el volumen de reproducción.
-    ///
-    /// Rango válido: `0.0` (mute absoluto) a `1.0` (máximo).
-    /// Valores fuera de rango se clampan.
-    pub fn set_volume(&mut self, vol: f32) {
-        self.volume = vol.clamp(0.0, 1.0);
-    }
-
-    /// Carga nuevas muestras y comienza la reproducción desde el principio.
-    ///
-    /// Si `samples` excede `MAX_PREVIEW_SAMPLES`, se trunca silenciosamente
-    /// para respetar el límite pre-alocado.
-    pub fn play(&mut self, samples: Vec<f32>) {
-        let len = samples.len().min(MAX_PREVIEW_SAMPLES);
-
-        // Copiamos las muestras al buffer pre-alocado. No hay realocación.
-        self.buffer[..len].copy_from_slice(&samples[..len]);
-
-        // Si el buffer original era más largo, limpiamos el resto para evitar
-        // ruido residual en reproducciones futuras más cortas.
-        if len < MAX_PREVIEW_SAMPLES {
-            self.buffer[len..].fill(0.0);
+    /// Activa la reproducción con datos pre-decoded.
+    /// Llamado bajo engine Mutex — seguro para escribir UnsafeCell.
+    pub fn start(&self, samples: Vec<f32>, channels: usize, generation: u64) {
+        let len = samples.len();
+        unsafe {
+            *self.data.get() = samples;
+            *self.channels.get() = channels.max(1);
+            *self.length.get() = len;
         }
-
-        self.position = 0;
-        self.length = len;
-        self.is_playing = len > 0;
+        self.cursor.store(0, Ordering::Relaxed);
+        self.generation.store(generation, Ordering::Relaxed);
+        // Release: data/channels/length visibles antes de is_playing = true.
+        self.is_playing.store(true, Ordering::Release);
     }
 
-    /// Detiene la reproducción, resetea la posición a cero y limpia el estado.
-    ///
-    /// El buffer interno se mantiene pre-alocado; solo se limpia su contenido
-    /// para evitar que queden muestras "fantasma" si se reanuda sin `play()`.
-    pub fn stop(&mut self) {
-        self.is_playing = false;
-        self.position = 0;
-        self.length = 0;
-        self.buffer.fill(0.0);
+    /// Detiene la reproducción.
+    pub fn stop(&self) {
+        self.is_playing.store(false, Ordering::Release);
+        self.cursor.store(0, Ordering::Relaxed);
     }
 
-    /// Indica si hay preview sonando (para el gate del Master Mixer).
-    #[inline]
-    pub fn is_playing(&self) -> bool {
-        self.is_playing
-    }
-
-    /// Callback de procesamiento de audio — ejecutado en el hilo de CPAL.
+    /// Mezcla el preview en el buffer de CPAL (interleaved stereo).
     ///
-    /// Mezcla las muestras del buffer en `output` aplicando el volumen actual.
-    /// Cuando el buffer se agota, levanta `is_playing = false` automáticamente.
+    /// - **Stereo** (channels=2): copia pares [L,R] directo.
+    /// - **Mono** (channels=1): duplica cada sample a L y R.
+    /// - Aplica volumen y clamping. Mezcla aditiva.
     ///
-    /// # Lock-free / No-alloc garantía
-    /// - Solo lectura/escritura de campos primitivos.
-    /// - Sin `Vec::push`, `Box`, `String`, `Mutex` ni `RwLock`.
-    pub fn process(&mut self, output: &mut [f32]) {
-        if !self.is_playing {
+    /// # Safety
+    /// Los campos `data`/`channels`/`length` solo se leen aquí. Se garantiza
+    /// que fueron escritos bajo engine Mutex antes de `is_playing = true`
+    /// (Release/Acquire pair). El CPAL callback lee con Acquire en `is_playing`.
+    pub fn process(&self, output: &mut [f32]) {
+        if !self.is_playing.load(Ordering::Acquire) {
             return;
         }
 
-        let active_len = self.length.min(self.buffer.len());
-        let vol = self.volume;
+        let data = unsafe { &*self.data.get() };
+        let channels = unsafe { *self.channels.get() };
+        let length = unsafe { *self.length.get() };
+        let vol = f32::from_bits(self.volume_bits.load(Ordering::Relaxed));
+        let active_len = length.min(data.len());
 
-        for frame in output.iter_mut() {
-            if self.position < active_len {
-                // Mezcla aditiva: sumamos al frame existente para permitir
-                // superposición con otras fuentes en el motor maestro.
-                *frame += self.buffer[self.position] * vol;
-                self.position += 1;
-            } else {
-                // Fin del buffer: frenamos limpio.
-                self.is_playing = false;
-                break;
+        if channels == 2 {
+            let mut i = 0;
+            while i + 1 < output.len() {
+                let pos = self.cursor.fetch_add(2, Ordering::Relaxed);
+                if pos + 1 < active_len {
+                    let l = (data[pos] * vol).clamp(-1.0, 1.0);
+                    let r = (data[pos + 1] * vol).clamp(-1.0, 1.0);
+                    output[i] += l;
+                    output[i + 1] += r;
+                    i += 2;
+                } else {
+                    self.is_playing.store(false, Ordering::Release);
+                    break;
+                }
+            }
+        } else {
+            let mut i = 0;
+            while i + 1 < output.len() {
+                let pos = self.cursor.fetch_add(1, Ordering::Relaxed);
+                if pos < active_len {
+                    let s = (data[pos] * vol).clamp(-1.0, 1.0);
+                    output[i] += s;
+                    output[i + 1] += s;
+                    i += 2;
+                } else {
+                    self.is_playing.store(false, Ordering::Release);
+                    break;
+                }
             }
         }
 
-        // ── DIAGNÓSTICO TEMPORAL: una sola vez por reproducción ──
-        // Muestra las primeras muestras escritas para confirmar que
-        // el buffer contiene audio real (no ceros) y la ganancia es > 0.
-        // Temporary: eliminar después de debug.
-        use std::sync::atomic::{AtomicBool, Ordering};
-        static DIAG_SENT: AtomicBool = AtomicBool::new(false);
-        if !DIAG_SENT.swap(true, Ordering::Relaxed) {
-            let written = output.len().min(16);
-            let first_samples: Vec<f32> = output[..written].iter().copied().collect();
-            let buf_end = written.min(self.length);
-            let buf_first: Vec<f32> = self.buffer[..buf_end].iter().copied().collect();
-            eprintln!(
-                "[AUDIO DIAG] preview_player.process() called: pos={}, active_len={}, vol={:.2}, output_len={}",
-                self.position, active_len, vol, output.len()
-            );
-            eprintln!(
-                "[AUDIO DIAG]   buffer[:16] = {:?}", buf_first
-            );
-            eprintln!(
-                "[AUDIO DIAG]   output[:16] = {:?}", first_samples
-            );
+        // Post-loop: si el buffer de salida se llenó exactamente con todos
+        // los samples, el loop termina sin entrar al else. Verificamos acá.
+        if self.is_playing.load(Ordering::Relaxed) {
+            let pos = self.cursor.load(Ordering::Relaxed);
+            if pos >= active_len {
+                self.is_playing.store(false, Ordering::Release);
+            }
         }
+    }
+}
+
+/// Reproductor de preview — API del engine.
+///
+/// Contiene un `Arc<PreviewBuffer>` que el CPAL callback lee directamente.
+/// `play()` y `stop()` se llaman bajo engine Mutex.
+pub struct PreviewPlayer {
+    /// Buffer activo compartido con el CPAL callback.
+    shared: Arc<PreviewBuffer>,
+    /// Generación actual — para detectar decodes obsoletos.
+    generation: u64,
+    /// Volumen local (copiado al buffer atómico en `set_volume`).
+    volume: f32,
+}
+
+impl PreviewPlayer {
+    pub fn new() -> Self {
+        Self {
+            shared: Arc::new(PreviewBuffer::new()),
+            generation: 0,
+            volume: 0.8,
+        }
+    }
+
+    /// Devuelve una referencia compartida al buffer para el CPAL callback.
+    pub fn shared_buffer(&self) -> Arc<PreviewBuffer> {
+        self.shared.clone()
+    }
+
+    pub fn set_volume(&mut self, vol: f32) {
+        self.volume = vol.clamp(0.0, 1.0);
+        self.shared
+            .volume_bits
+            .store(self.volume.to_bits(), Ordering::Relaxed);
+    }
+
+    /// Carga samples pre-decoded y comienza la reproducción.
+    /// Llamado bajo engine Mutex (command handler o decode thread).
+    pub fn play(&mut self, samples: Vec<f32>, channels: usize) {
+        self.generation = self.generation.wrapping_add(1);
+        self.shared.start(samples, channels, self.generation);
+    }
+
+    /// Detiene la reproducción.
+    pub fn stop(&mut self) {
+        self.shared.stop();
+    }
+
+    #[inline]
+    pub fn is_playing(&self) -> bool {
+        self.shared.is_playing.load(Ordering::Acquire)
     }
 }
 
 // ============================================================================
-// Tests unitarios
+// Tests
 // ============================================================================
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_volume_clamps_to_zero() {
-        let mut player = PreviewPlayer::new();
-        player.set_volume(0.0);
-        assert_eq!(player.volume, 0.0);
+    fn test_volume_clamps() {
+        let mut p = PreviewPlayer::new();
+        p.set_volume(0.0);
+        assert_eq!(p.volume, 0.0);
+        p.set_volume(1.5);
+        assert_eq!(p.volume, 1.0);
     }
 
     #[test]
-    fn test_volume_clamps_to_one() {
-        let mut player = PreviewPlayer::new();
-        player.set_volume(1.5);
-        assert_eq!(player.volume, 1.0);
+    fn test_stop_resets() {
+        let mut p = PreviewPlayer::new();
+        p.play(vec![0.5; 100], 1);
+        p.stop();
+        assert!(!p.is_playing());
+        assert_eq!(p.shared.cursor.load(Ordering::Relaxed), 0);
     }
 
     #[test]
-    fn test_stop_resets_state() {
-        let mut player = PreviewPlayer::new();
-        player.play(vec![0.5; 100]);
-        player.stop();
+    fn test_mono_play_and_process() {
+        let mut p = PreviewPlayer::new();
+        p.play(vec![0.5; 4], 1);
+        p.set_volume(1.0);
 
-        assert!(!player.is_playing);
-        assert_eq!(player.position, 0);
-        assert!(player.buffer.iter().all(|&s| s == 0.0));
+        let buf = p.shared_buffer();
+        assert!(buf.is_playing.load(Ordering::Acquire));
+
+        let mut out = vec![0.0; 8];
+        buf.process(&mut out);
+
+        assert!(!buf.is_playing.load(Ordering::Acquire));
+        assert_eq!(buf.cursor.load(Ordering::Relaxed), 4);
+        for frame in 0..4 {
+            assert_eq!(out[frame * 2], 0.5);
+            assert_eq!(out[frame * 2 + 1], 0.5);
+        }
     }
 
     #[test]
-    fn test_process_mutes_at_zero_volume() {
-        let mut player = PreviewPlayer::new();
-        player.play(vec![1.0; 10]);
-        player.set_volume(0.0);
+    fn test_stereo_play_and_process() {
+        let mut p = PreviewPlayer::new();
+        p.play(vec![0.3, 0.7, 0.1, 0.9], 2);
+        p.set_volume(1.0);
 
-        let mut output = vec![0.0; 10];
-        player.process(&mut output);
+        let buf = p.shared_buffer();
+        let mut out = vec![0.0; 4];
+        buf.process(&mut out);
 
-        assert!(output.iter().all(|&s| s == 0.0));
+        assert_eq!(out[0], 0.3);
+        assert_eq!(out[1], 0.7);
+        assert_eq!(out[2], 0.1);
+        assert_eq!(out[3], 0.9);
     }
 
     #[test]
-    fn test_process_stops_at_buffer_end() {
-        let mut player = PreviewPlayer::new();
-        player.play(vec![0.5; 5]);
+    fn test_stereo_not_half_speed() {
+        let mut p = PreviewPlayer::new();
+        p.play(vec![1.0, -1.0, 0.5, -0.5], 2);
+        p.set_volume(1.0);
 
-        let mut output = vec![0.0; 10];
-        player.process(&mut output);
+        let buf = p.shared_buffer();
+        let mut out = vec![0.0; 4];
+        buf.process(&mut out);
 
-        assert!(!player.is_playing);
-        assert_eq!(player.position, 5);
-        assert_eq!(output[..5], [0.4; 5]); // 0.5 * 0.8 (volumen por defecto)
-        assert_eq!(output[5..], [0.0; 5]);
+        assert_eq!(buf.cursor.load(Ordering::Relaxed), 4);
+        assert_eq!(out[0], 1.0);
+        assert_eq!(out[1], -1.0);
+        assert_eq!(out[2], 0.5);
+        assert_eq!(out[3], -0.5);
+    }
+
+    #[test]
+    fn test_clamping() {
+        let mut p = PreviewPlayer::new();
+        p.play(vec![2.0, -2.0], 2);
+        p.set_volume(1.0);
+
+        let buf = p.shared_buffer();
+        let mut out = vec![0.0; 2];
+        buf.process(&mut out);
+
+        assert_eq!(out[0], 1.0);
+        assert_eq!(out[1], -1.0);
+    }
+
+    #[test]
+    fn test_volume_applied() {
+        let mut p = PreviewPlayer::new();
+        p.play(vec![0.5, 0.5], 2);
+        p.set_volume(0.5);
+
+        let buf = p.shared_buffer();
+        let mut out = vec![0.0; 2];
+        buf.process(&mut out);
+
+        assert_eq!(out[0], 0.25);
+        assert_eq!(out[1], 0.25);
+    }
+
+    #[test]
+    fn test_additive_mix() {
+        let mut p = PreviewPlayer::new();
+        p.play(vec![0.5, 0.5], 2);
+        p.set_volume(1.0);
+
+        let buf = p.shared_buffer();
+        let mut out = vec![0.3, 0.3];
+        buf.process(&mut out);
+
+        assert_eq!(out[0], 0.8);
+        assert_eq!(out[1], 0.8);
+    }
+
+    #[test]
+    fn test_mute_at_zero_volume() {
+        let mut p = PreviewPlayer::new();
+        p.play(vec![1.0; 4], 1);
+        p.set_volume(0.0);
+
+        let buf = p.shared_buffer();
+        let mut out = vec![0.5; 4];
+        buf.process(&mut out);
+
+        assert!(out.iter().all(|&s| s == 0.5));
+    }
+
+    #[test]
+    fn test_generation_increments() {
+        let mut p = PreviewPlayer::new();
+        let gen0 = p.generation;
+        p.play(vec![0.5; 10], 1);
+        let gen1 = p.generation;
+        assert!(gen1 > gen0);
+        p.play(vec![0.5; 20], 1);
+        let gen2 = p.generation;
+        assert!(gen2 > gen1);
+    }
+
+    #[test]
+    fn test_partial_process() {
+        let mut p = PreviewPlayer::new();
+        p.play(vec![0.5; 10], 2); // 10 interleaved = 5 stereo frames
+        p.set_volume(1.0);
+
+        let buf = p.shared_buffer();
+        // Output only room for 2 frames (4 samples)
+        let mut out = vec![0.0; 4];
+        buf.process(&mut out);
+
+        assert!(buf.is_playing.load(Ordering::Acquire)); // still has data
+        assert_eq!(buf.cursor.load(Ordering::Relaxed), 4);
+
+        // Process remaining
+        let mut out2 = vec![0.0; 20];
+        buf.process(&mut out2);
+
+        assert!(!buf.is_playing.load(Ordering::Acquire)); // finished
+    }
+
+    #[test]
+    fn test_new_preview_replaces_old() {
+        let mut p = PreviewPlayer::new();
+        p.set_volume(1.0);
+
+        // Play first sample
+        p.play(vec![0.1; 4], 2);
+        let buf = p.shared_buffer();
+
+        // Process half
+        let mut out = vec![0.0; 4];
+        buf.process(&mut out);
+
+        // Load new sample (simulates rapid click)
+        p.play(vec![0.9; 4], 2);
+
+        // Should hear new sample, not old
+        let mut out2 = vec![0.0; 4];
+        buf.process(&mut out2);
+
+        assert_eq!(out2[0], 0.9);
+        assert_eq!(out2[1], 0.9);
     }
 }

@@ -614,10 +614,10 @@ impl<'a> AudioEngine<'a> {
         samples.fill(0.0);
 
         // ── PREVIEW: SIEMPRE se mezcla si está activo ──
-        // El preview del explorador suena SIEMPRE, con o sin transporte
-        // corriendo. La anti-fuga se gestiona en `play()` (stop del
-        // preview) y en el command handler (StopPreview antes de Play).
-        self.preview_player.process(samples);
+        // Lee del `Arc<PreviewBuffer>` vía AtomicUsize cursor — cero locks.
+        // El decode thread carga datos y activa con `is_playing.store(true)`.
+        let preview = self.preview_player.shared_buffer();
+        preview.process(samples);
 
         // ── CLIP MIXING: solo cuando el transporte reproduce ──
         if self.transport.playback_state == TransportPlaybackState::Playing {
@@ -854,7 +854,7 @@ mod tests {
         // FUGA #1: Play global debe hacer stop() del preview (buffer limpio,
         // flag abajo) para que no se mezcle con el Master Mixer.
         let mut engine = test_engine();
-        engine.preview_player.play(vec![0.5f32; 1024]);
+        engine.preview_player.play(vec![0.5f32; 1024], 1);
         assert!(engine.preview_player.is_playing());
         engine.play();
         assert!(!engine.preview_player.is_playing());
@@ -868,10 +868,10 @@ mod tests {
         // antes de Play). Un PreviewSample tardío DESPUÉS del Play sí se
         // mezcla: el usuario pidió pre-escuchar mientras el timeline corre.
         let mut engine = test_engine();
-        engine.preview_player.play(vec![0.5f32; 4096]);
+        engine.preview_player.play(vec![0.5f32; 4096], 1);
         engine.play();
         // Simular PreviewSample tardío (mpsc) DESPUÉS del Play.
-        engine.preview_player.play(vec![0.5f32; 4096]);
+        engine.preview_player.play(vec![0.5f32; 4096], 1);
         assert!(engine.preview_player.is_playing());
         let mut raw = vec![0.0f32; 512 * 2];
         let mut buf = AudioBuffer::new(&mut raw);
