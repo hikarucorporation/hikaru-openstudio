@@ -106,6 +106,20 @@ impl TransportPosition {
         (ticks as f64 * self.seconds_per_tick() * sr).round() as u64
     }
 
+    /// Longitud del clip en frames con el tempo REAL del transporte.
+    ///
+    /// FUGA #2 (135 BPM vs 120 BPM): los compases visuales del Clip Editor
+    /// (en ticks) solo coinciden con la parada real del engine si los frames
+    /// se derivan de `ticks_to_samples` con el BPM activo del transporte.
+    /// Calcular con otro tempo o con un `samples_per_bar` rancio desplaza la
+    /// parada en miles de samples. La GUI debe usar esto (vía
+    /// `transport.clip_length_frames(duration_ticks)`) y propagar el BPM con
+    /// `SetBpm` ANTES de sincronizar clips.
+    #[inline]
+    pub fn clip_length_frames(&self, duration_ticks: u64) -> u64 {
+        self.ticks_to_samples(duration_ticks)
+    }
+
     /// Samples -> ticks con BPM activo + SR real + PPQN único.
     /// Inversa exacta de `ticks_to_samples` (salvo redondeo).
     pub fn samples_to_ticks(&self, samples: u64) -> u64 {

@@ -151,7 +151,9 @@ fn main() -> Result<(), eframe::Error> {
                 }
                 GuiCommand::StopPreview => {
                     if let Ok(mut engine) = engine_for_commands.lock() {
-                        engine.preview_player.play(Vec::new());
+                        // Corte categórico: stop() limpia buffer/posición/flag.
+                        // `play(Vec::new())` dejaba la semántica ambigua.
+                        engine.preview_player.stop();
                     }
                 }
                 GuiCommand::SetPreviewVolume(vol) => {
@@ -258,6 +260,13 @@ fn main() -> Result<(), eframe::Error> {
         .map(|engine| engine.sample_rate)
         .unwrap_or(44100.0);
 
+    // Pico real de salida para el vúmetro (0.0 == -inf dB en silencio).
+    // Se clona el Arc del engine: el callback publica, la GUI solo lee.
+    let output_level_bits = engine_arc
+        .lock()
+        .map(|engine| engine.output_level_bits.clone())
+        .unwrap_or_else(|_| std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)));
+
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Hikaru OpenStudio")
@@ -269,7 +278,17 @@ fn main() -> Result<(), eframe::Error> {
         "Hikaru OpenStudio",
         native_options,
         Box::new(move |cc| {
-            let mut app = HikaruApp::new(cc, audio_proxy, audio_stream, position_clock);
+            // Handle compartido al engine para el polling por frame de la
+            // Session Matrix: la GUI lee `is_playing` / `VoiceState` con
+            // `try_lock` y apaga el pad en verde al terminar la voz.
+            let mut app = HikaruApp::new(
+                cc,
+                audio_proxy,
+                audio_stream,
+                position_clock,
+                output_level_bits,
+                Some(engine_arc.clone()),
+            );
             // Transporte GUI con el SR real del motor (no 44100 fijo).
             app.sync_hardware_sample_rate(hardware_sr);
             Box::new(app)
@@ -300,9 +319,24 @@ fn init_cpal_stream(
     let stream = device.build_output_stream(
         stream_config,
         move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-            if let Ok(mut lock) = engine.lock() {
-                let mut buffer = hikaru_core::AudioBuffer { samples: data };
-                lock.process(&mut buffer);
+            // FIX audio fantasma: si el try_lock() falla por contención
+            // GUI/hilo-audio, el buffer NO debe quedar con muestras previas
+            // en RAM (la tarjeta las repetiría como bucle infinito aunque el
+            // clip ya terminó en el compás 5). Garantía absoluta:
+            // 1) pre-limpieza antes de intentar el lock, así NINGÚN retorno
+            //    deja basura no procesada;
+            // 2) rama Err re-afirma silencio explícito.
+            // Resultado en fallo de lock: SILENCIO ABSOLUTO (0.0 / -inf dB).
+            data.fill(0.0);
+            match engine.try_lock() {
+                Ok(mut lock) => {
+                    let mut buffer = hikaru_core::AudioBuffer { samples: data };
+                    lock.process(&mut buffer);
+                }
+                Err(_) => {
+                    // Lock ocupado (GUI decodificando, etc.): mantener ceros.
+                    data.fill(0.0);
+                }
             }
         },
         |err| {

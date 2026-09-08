@@ -76,7 +76,7 @@ impl Track {
 
 // --- MAIN MIXER RENDER ---
 
-pub fn show(ui: &mut Ui, tracks: &mut Vec<Track>, selected_idx: &mut usize, current_mode: &mut AppMode) {
+pub fn show(ui: &mut Ui, tracks: &mut Vec<Track>, selected_idx: &mut usize, current_mode: &mut AppMode, output_level: f32) {
     let shift_pressed = ui.input(|i| i.modifiers.shift);
 
     let left_pressed = ui.input(|i| i.key_pressed(egui::Key::ArrowLeft));
@@ -200,9 +200,12 @@ pub fn show(ui: &mut Ui, tracks: &mut Vec<Track>, selected_idx: &mut usize, curr
         ui.separator();
 
         // --- MIXER BODY ---
+        // El vúmetro del MASTER muestra el pico REAL del engine
+        // (`output_level`: 0.0 == -inf dB en silencio). Antes dibujaba
+        // `track.volume` (el fader) y mentía en compases sin audio.
         ui.with_layout(egui::Layout::left_to_right(egui::Align::Min), |ui| {
             if let Some(master) = tracks.get_mut(0) {
-                render_channel_strip(ui, master, fader_height, &tracks_map, *selected_idx == 0, selected_idx, 0, nav_event);
+                render_channel_strip(ui, master, fader_height, &tracks_map, *selected_idx == 0, selected_idx, 0, nav_event, output_level);
             }
 
             ui.add_space(2.0);
@@ -215,7 +218,12 @@ pub fn show(ui: &mut Ui, tracks: &mut Vec<Track>, selected_idx: &mut usize, curr
                     ui.with_layout(egui::Layout::left_to_right(egui::Align::Min), |ui| {
                         for i in 1..tracks.len() {
                             if let Some(track) = tracks.get_mut(i) {
-                                render_channel_strip(ui, track, fader_height, &tracks_map, i == *selected_idx, selected_idx, i, nav_event);
+                                // Canales no-master: sin medición por pista aún,
+                                // el vúmetro sigue al fader atenuado por el
+                                // nivel real del master (si el master está en
+                                // silencio, todo está en silencio).
+                                let ch_level = (track.volume * output_level).clamp(0.0, 1.0);
+                                render_channel_strip(ui, track, fader_height, &tracks_map, i == *selected_idx, selected_idx, i, nav_event, ch_level);
                                 ui.add_space(4.0);
                             }
                         }
@@ -233,7 +241,8 @@ fn render_channel_strip(
     is_selected: bool, 
     selected_idx: &mut usize, 
     current_idx: usize,
-    should_scroll: bool
+    should_scroll: bool,
+    vu_level: f32,
 ) {
     let border_color = if is_selected { Color32::from_rgb(255, 110, 0) } else { Color32::from_gray(40) };
     let bg_color = if track.is_master { Color32::from_rgb(30, 30, 45) } else if is_selected { Color32::from_rgb(35, 35, 35) } else { Color32::from_rgb(25, 25, 30) };
@@ -288,10 +297,11 @@ fn render_channel_strip(
 
                     ui.add_space(5.0);
 
-                    // FADER & VU
+                    // FADER & VU: el VU muestra señal REAL, no el fader.
+                    // En silencio (compás sin audio) vu_level == 0.0 == -inf.
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 8.0;
-                        draw_vu_meter(ui, track.volume, fader_h);
+                        draw_vu_meter(ui, vu_level, fader_h);
                         custom_v_fader(ui, &mut track.volume, Vec2::new(35.0, fader_h));
                     });
 

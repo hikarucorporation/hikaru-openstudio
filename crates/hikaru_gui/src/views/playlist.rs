@@ -525,6 +525,8 @@ pub fn show(
     show_impl(
         ui, state, tracks, current_bar, dragged_sample, audio_proxy, bpm, sample_rate,
         ViewMode::Arranger, loop_enabled, transport_sample_count, beats_per_bar,
+        // Arranger: sin override, la aguja es el cursor global.
+        None,
     );
 }
 
@@ -540,6 +542,11 @@ pub fn show_embedded(
     title: &str,
     transport_sample_count: u64,
     beats_per_bar: u32,
+    // Override del playhead en ticks para el ClipEditor OpenLive: cuando
+    // hay voz activa, la aguja deriva del elapsed LINEAL de la voz (0 al
+    // disparar → línea del compás 1), no del cursor global. `None` =
+    // comportamiento clásico (cursor global).
+    playhead_override_ticks: Option<u64>,
 ) {
     // En modo OPENLIVE / ClipEditor el Shift+Drag sobre la regla define el
     // loop individual del clip (`clip.loop_start` / `clip.loop_end` via
@@ -548,6 +555,7 @@ pub fn show_embedded(
     show_impl(
         ui, state, tracks, local_bar, dragged_sample, audio_proxy, bpm, sample_rate,
         ViewMode::ClipEditor { title }, true, transport_sample_count, beats_per_bar,
+        playhead_override_ticks,
     );
 }
 
@@ -564,6 +572,7 @@ fn show_impl(
     loop_enabled: bool,
     transport_sample_count: u64,
     beats_per_bar: u32,
+    playhead_override_ticks: Option<u64>,
 ) {
     // Sincronización PPQN: la GUI no hardcodea 960; la única fuente de
     // verdad es `DEFAULT_PPQN` (= `transport.ppqn()`). Si el estado trae
@@ -579,12 +588,17 @@ fn show_impl(
     // Playhead exacto: samples -> ticks con BPM activo + SR real + PPQN único.
     // NO se deriva de `current_bar: f32` (pierde precisión y corre más rápido
     // que el audio); el bar solo se deriva para compatibilidad visual.
+    // En ClipEditor con voz activa, el override manda: elapsed lineal de la
+    // voz (0 al disparar → tick 0 → aguja EXACTA sobre la línea del compás 1
+    // cuando el transporte resetea a bar 1, frame 0). Sin override, cursor.
     let ppqn = state.ppqn.max(1);
     let beats_per_bar = beats_per_bar.max(1);
     let ticks_per_bar = ppqn * beats_per_bar as u64;
     let bpm_safe = bpm.max(1.0);
-    state.playhead_tick =
-        samples_to_ticks_precise(transport_sample_count, ppqn, bpm_safe, sample_rate);
+    state.playhead_tick = match playhead_override_ticks {
+        Some(t) => t,
+        None => samples_to_ticks_precise(transport_sample_count, ppqn, bpm_safe, sample_rate),
+    };
     // Bar visual coherente con el mismo origen (f64, sin pasar por f32).
     let bar_from_transport =
         (state.playhead_tick as f64 / ticks_per_bar as f64) + 1.0;

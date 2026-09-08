@@ -5,7 +5,7 @@
 
 pub mod preview_player;
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use hikaru_core::{AudioBuffer, SampleRate};
@@ -22,12 +22,26 @@ pub enum EngineMode {
     OpenStudio,
 }
 
+/// Estado runtime de la voz del clip en el render callback.
+/// Categórico: sin loop de clip activo y pasado el final, la voz es
+/// `Finished` (dormida) y solo emite silencio absoluto (0.0).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VoiceState {
+    Active,
+    Finished,
+}
+
 pub struct AudioClipInstance {
     pub id: usize,
     pub track_index: usize,
     pub scene_index: usize,
     pub samples: Vec<f32>,
     pub start_frame: u64,
+    /// Reloj LINEAL de disparo (reloj absoluto del engine, sin wrap del
+    /// loop global). La vida de la voz OpenLive se mide SIEMPRE contra
+    /// este reloj: el Time Selection solo mueve el cursor, jamás extiende
+    /// ni reinicia una voz. Solo `clip_loop_enabled == true` loopea.
+    pub start_absolute: u64,
     pub duration_frames: u64,
     pub sample_offset: usize,
     pub channels: usize,
@@ -64,6 +78,170 @@ impl AudioClipInstance {
             self.natural_frames()
         }
     }
+
+    /// Resuelve el frame del buffer fuente para una posición global del
+    /// transporte (en samples, ya con wrap del loop global aplicado).
+    ///
+    /// 1. Gating por longitud real (`natural_frames`) / ventana de emisión
+    ///    (`duration_frames`): sin loop explícito válido, si `elapsed`
+    ///    supera la muestra se retorna `None` (la voz muteará con 0.0) en
+    ///    lugar de hacer free-run (`elapsed % natural`).
+    /// 2. Con loop explícito, el wraparound se sincroniza con el Time
+    ///    Selection global (`transport.loop_start_samples` /
+    ///    `loop_end_samples`): la fase se ancla a `loop_start_samples`
+    ///    para que coincida con el wrap del transporte.
+    ///
+    /// CATEGÓRICO (bug compás 5→7): este `None` significa silencio
+    /// absoluto. El caller NO debe hacer `%`, debe dejar el 0.0 del
+    /// `buffer.fill(0.0)` y dormir la voz (`VoiceState::Finished` /
+    /// `is_playing = false`).
+    pub fn voice_frame(
+        &self,
+        global_pos: u64,
+        transport: &TransportPosition,
+    ) -> Option<usize> {
+        if global_pos < self.start_frame {
+            return None;
+        }
+        let natural = self.natural_frames();
+        if natural == 0 {
+            return None;
+        }
+        let elapsed = global_pos - self.start_frame;
+
+        if self.has_valid_clip_loop() {
+            let loop_start = self.clip_loop_start.min(natural);
+            let loop_end = self.clip_loop_end.min(natural.max(1)).max(loop_start + 1);
+            let loop_len = loop_end.saturating_sub(loop_start).max(1);
+            if elapsed < loop_end {
+                return Some(elapsed as usize);
+            }
+            // Loopeo explícito: sincronizar wraparound con el loop global
+            // (Time Selection) cuando la región es válida.
+            if transport.has_valid_loop() {
+                let since_global = global_pos.saturating_sub(transport.loop_start_samples);
+                return Some((loop_start + (since_global % loop_len)) as usize);
+            }
+            return Some((loop_start + ((elapsed - loop_start) % loop_len)) as usize);
+        }
+
+        // Sin loop por clip: gating estricto. La ventana de emisión válida
+        // es el mínimo entre la duración en timeline y la muestra real.
+        // CATEGÓRICO: `elapsed >= emission_len` → None (0.0 + Finished).
+        let emission_len = self.emission_len_frames();
+        if elapsed >= emission_len {
+            return None;
+        }
+        Some(elapsed as usize)
+    }
+
+    /// Fase de la voz OpenLive sobre el reloj LINEAL del engine
+    /// (`absolute_frame`, sin wrap del loop global).
+    ///
+    /// REGLA DEL CLIP MANDA: el wraparound/loopeo ocurre SI Y SÓLO SI
+    /// `clip_loop_enabled` es válido. El Time Selection (loop global) NO
+    /// re-emite ni extiende la voz: con el cursor loopeando en una región
+    /// más corta que el clip, `elapsed` lineal igual supera `emission_len`
+    /// y la voz muta a `(0.0, 0.0)` y se duerme. Sin `%` global.
+    pub fn voice_frame_linear(&self, abs_pos: u64) -> Option<usize> {
+        if abs_pos < self.start_absolute {
+            return None;
+        }
+        let natural = self.natural_frames();
+        if natural == 0 {
+            return None;
+        }
+        let elapsed = abs_pos - self.start_absolute;
+
+        if self.has_valid_clip_loop() {
+            let loop_start = self.clip_loop_start.min(natural);
+            let loop_end = self.clip_loop_end.min(natural.max(1)).max(loop_start + 1);
+            let loop_len = loop_end.saturating_sub(loop_start).max(1);
+            if elapsed < loop_end {
+                return Some(elapsed as usize);
+            }
+            // Loop EXPLÍCITO del clip, sobre tiempo lineal propio.
+            // Sin ancla al Time Selection: el clip manda sobre el timeline.
+            return Some((loop_start + ((elapsed - loop_start) % loop_len)) as usize);
+        }
+
+        // Sin loop por clip: gating estricto sobre tiempo lineal.
+        // Compases 10..15 de un clip de 9 (dentro o fuera del Time
+        // Selection) → None (0.0 + Finished).
+        let emission_len = self.emission_len_frames();
+        if elapsed >= emission_len {
+            return None;
+        }
+        Some(elapsed as usize)
+    }
+
+    /// Estado runtime OpenLive sobre el reloj lineal.
+    pub fn voice_state_linear(&self, abs_pos: u64) -> VoiceState {
+        match self.voice_frame_linear(abs_pos) {
+            Some(_) => VoiceState::Active,
+            None => VoiceState::Finished,
+        }
+    }
+
+    /// Ventana de emisión válida en frames: mínimo entre timeline y muestra.
+    pub fn emission_len_frames(&self) -> u64 {
+        let natural = self.natural_frames();
+        if self.duration_frames > 0 {
+            self.duration_frames.min(natural)
+        } else {
+            natural
+        }
+    }
+
+    /// Estado runtime de la voz para `global_pos`.
+    /// `None` de `voice_frame` (área sin datos) → `Finished` (dormida).
+    pub fn voice_state(&self, global_pos: u64, transport: &TransportPosition) -> VoiceState {
+        match self.voice_frame(global_pos, transport) {
+            Some(_) => VoiceState::Active,
+            None => VoiceState::Finished,
+        }
+    }
+
+    /// Lectura categórica del buffer fuente (frame mono → sample L).
+    ///
+    /// Exigencia #1 del render callback:
+    /// si `current_sample_index >= total` (natural/offset) y NO hay loop
+    /// de clip activo, retorna `0.0` (silencio absoluto) en lugar de
+    /// avanzar o hacer módulo. Cualquier OOB, NaN o infinito → 0.0.
+    pub fn read_sample(&self, current_sample_index: usize) -> f32 {
+        // Corte categórico sin loop: pasado el natural → silencio.
+        if !self.has_valid_clip_loop() {
+            if (current_sample_index as u64) >= self.natural_frames() {
+                return 0.0;
+            }
+        }
+        let ch = self.channels.max(1);
+        let idx = current_sample_index.saturating_mul(ch);
+        match self.samples.get(idx) {
+            Some(&s) if s.is_finite() => s,
+            _ => 0.0,
+        }
+    }
+
+    /// Lectura del canal derecho (o duplicado de L si es mono), con el
+    /// mismo corte categórico a 0.0 que `read_sample`.
+    pub fn read_sample_r(&self, current_sample_index: usize) -> f32 {
+        if !self.has_valid_clip_loop() {
+            if (current_sample_index as u64) >= self.natural_frames() {
+                return 0.0;
+            }
+        }
+        let ch = self.channels.max(1);
+        let idx = current_sample_index.saturating_mul(ch);
+        if ch > 1 {
+            match self.samples.get(idx + 1) {
+                Some(&s) if s.is_finite() => s,
+                _ => 0.0,
+            }
+        } else {
+            self.read_sample(current_sample_index)
+        }
+    }
 }
 
 pub struct AudioEngine<'a> {
@@ -77,6 +255,15 @@ pub struct AudioEngine<'a> {
     pub preview_player: PreviewPlayer,
     // Referencia compartida del reloj de muestras con la GUI
     pub position_clock: Arc<AtomicU64>,
+    /// Reloj LINEAL monótono en frames (solo avanza en `Playing`, nunca
+    /// hace wrap). Base de la vida de las voces OpenLive: el cursor
+    /// (`transport.sample_count`) puede loopear en el Time Selection, pero
+    /// este reloj no, así el Time Selection jamás extiende una voz.
+    pub absolute_frame: u64,
+    /// Pico de salida real del último bloque procesado (bits de f32).
+    /// La GUI lo lee para el vúmetro: 0.0 == silencio == -inf dB.
+    /// Sin esto el vúmetro dibujaba el fader y mentía en áreas sin audio.
+    pub output_level_bits: Arc<AtomicU32>,
 }
 
 impl<'a> AudioEngine<'a> {
@@ -94,6 +281,23 @@ impl<'a> AudioEngine<'a> {
             clips: Vec::new(),
             preview_player: PreviewPlayer::new(),
             position_clock,
+            absolute_frame: 0,
+            output_level_bits: Arc::new(AtomicU32::new(0.0f32.to_bits())),
+        }
+    }
+
+    /// Pico real del último bloque (0.0 == silencio absoluto).
+    pub fn output_peak(&self) -> f32 {
+        f32::from_bits(self.output_level_bits.load(Ordering::Relaxed))
+    }
+
+    /// Nivel en dB del último bloque (-inf si es silencio).
+    pub fn output_db(&self) -> f32 {
+        let peak = self.output_peak();
+        if peak <= 0.0 || !peak.is_finite() {
+            f32::NEG_INFINITY
+        } else {
+            20.0 * peak.log10()
         }
     }
 
@@ -206,16 +410,24 @@ impl<'a> AudioEngine<'a> {
         };
         let sample_offset = (offset_secs * self.sample_rate) as usize * ch;
 
+        // Voces OpenLive arrancan SIEMPRE detenidas (`is_playing = false`).
+        // Antes se infería de `self.mode == OpenStudio`: si el clip de la
+        // matriz se cargaba antes del `SetAppMode(false)` (engine aún en
+        // OpenStudio), la voz quedaba en `playing` invisible (GUI en
+        // `Stopped`) y sonaba sin pad verde hasta el compás 11 con el
+        // vúmetro marcando. En OpenStudio el flag se ignora (la mezcla es
+        // por ventana temporal), así que `false` inicial es seguro en ambos.
         let instance = AudioClipInstance {
             id,
             track_index,
             scene_index,
             samples,
             start_frame,
+            start_absolute: 0,
             duration_frames,
             sample_offset,
             channels: ch,
-            is_playing: self.mode == EngineMode::OpenStudio,
+            is_playing: false,
             clip_loop_enabled: false,
             clip_loop_start: 0,
             clip_loop_end: 0,
@@ -251,6 +463,13 @@ impl<'a> AudioEngine<'a> {
     }
 
     pub fn play(&mut self) {
+        // FUGA #1 (preview -> Master Mixer): al darle Play al transporte
+        // global el preview del explorer DEBE detenerse y silenciarse de
+        // inmediato. `stop()` limpia buffer/posición/flag para que ni un
+        // resto del buffer se mezcle durante la reproducción del timeline.
+        // El gate en `process()` (preview solo cuando NO se está en Playing)
+        // es la segunda barrera anti-fuga.
+        self.preview_player.stop();
         self.transport.playback_state = TransportPlaybackState::Playing;
     }
 
@@ -283,6 +502,7 @@ impl<'a> AudioEngine<'a> {
     /// fase arbitraria del reloj global.
     pub fn trigger_clip(&mut self, track_index: usize, scene_index: usize) {
         let now = self.transport.sample_count;
+        let now_abs = self.absolute_frame;
         let target_was_playing = self
             .clips
             .iter()
@@ -294,6 +514,7 @@ impl<'a> AudioEngine<'a> {
                 clip.is_playing = !target_was_playing;
                 if clip.is_playing {
                     clip.start_frame = now;
+                    clip.start_absolute = now_abs;
                 }
             } else {
                 clip.is_playing = false;
@@ -304,8 +525,13 @@ impl<'a> AudioEngine<'a> {
     /// Dispara una escena completa: en cada pista suena el clip de esa
     /// escena (si existe) y se frenan los demás. Las fases arrancan en el
     /// transporte actual para un ataque en conjunto.
+    /// Idempotente ante duplicados del mismo batch (la GUI envía UN solo
+    /// `TriggerScene` por click): si la voz ya está activa con
+    /// `start_frame == now`, se ignora sin cambiar estado ni reiniciar fase,
+    /// para que un reenvío no extienda la emisión hasta el compás 11.
     pub fn trigger_scene(&mut self, scene_index: usize) {
         let now = self.transport.sample_count;
+        let now_abs = self.absolute_frame;
         // Pistas que tienen clip en la escena.
         let mut tracks_with_clip = std::collections::HashSet::new();
         for clip in self.clips.iter() {
@@ -315,12 +541,62 @@ impl<'a> AudioEngine<'a> {
         }
         for clip in self.clips.iter_mut() {
             if clip.scene_index == scene_index {
+                // Duplicado del mismo instante lineal: no reiniciar.
+                // (Se compara el reloj ABSOLUTO, no el cursor con wrap:
+                // con el loop global el cursor repite valores y un
+                // relanzamiento legítimo se tragaría como duplicado.)
+                if clip.is_playing && clip.start_absolute == now_abs {
+                    continue;
+                }
                 clip.is_playing = true;
                 clip.start_frame = now;
+                clip.start_absolute = now_abs;
             } else if tracks_with_clip.contains(&clip.track_index) {
                 clip.is_playing = false;
             }
         }
+    }
+
+    /// ¿Sigue audible la voz OpenLive de un pad? Base LINEAL
+    /// (`absolute_frame`), no cursor con wrap: el polling GUI apaga el pad
+    /// cuando la emisión lineal se agota aunque el cursor siga loopeando.
+    pub fn voice_active(&self, track_index: usize, scene_index: usize) -> bool {
+        match self
+            .clips
+            .iter()
+            .find(|c| c.track_index == track_index && c.scene_index == scene_index)
+        {
+            None => false,
+            Some(clip) => {
+                if !clip.is_playing {
+                    return false;
+                }
+                clip.voice_state_linear(self.absolute_frame) == VoiceState::Active
+            }
+        }
+    }
+
+    /// Frames lineales elapsed de la voz de un pad (`absolute_frame` menos
+    /// `start_absolute`). `None` si no hay voz activa: la GUI usa el cursor
+    /// global como fallback. Con esto la aguja del Clip Track Editor deriva
+    /// de la VOZ (0 al disparar → tick 0 → línea del compás 1), nunca del
+    /// cursor global, así aguja visual y audio coinciden en el golpe a 0 ms.
+    pub fn voice_elapsed_frames(
+        &self,
+        track_index: usize,
+        scene_index: usize,
+    ) -> Option<u64> {
+        let clip = self
+            .clips
+            .iter()
+            .find(|c| c.track_index == track_index && c.scene_index == scene_index)?;
+        if !clip.is_playing {
+            return None;
+        }
+        if clip.voice_state_linear(self.absolute_frame) != VoiceState::Active {
+            return None;
+        }
+        Some(self.absolute_frame.saturating_sub(clip.start_absolute))
     }
 
     pub fn stop_track(&mut self, track_index: usize) {
@@ -333,105 +609,160 @@ impl<'a> AudioEngine<'a> {
         let samples = out_buffer.get_samples_mut();
         let num_channels = 2; // Estéreo
 
+        // Exigencia #2: el buffer del bloque actual se rellena
+        // explícitamente con ceros. El área sin datos de audio es
+        // silencio absoluto, nunca basura del callback anterior.
+        // El `continue` de las voces terminadas deja este 0.0 intacto.
         samples.fill(0.0);
 
-        // Procesar preview incluso si el transport está detenido
-        self.preview_player.process(samples);
-
+        // FUGA #1: el preview del explorer NUNCA se mezcla con el Master
+        // Mixer durante la reproducción del timeline. Solo suena cuando el
+        // transporte NO está en Playing (Stopped/Paused para pre-escucha).
+        // En Playing el `play()` ya hizo `stop()`, y este gate impide que
+        // un `PreviewSample` tardío (mpsc) contamine el mix. Si igual llegó
+        // tarde, se descarta (stop) para que no quede encolado al frenar el
+        // timeline.
         if self.transport.playback_state != TransportPlaybackState::Playing {
+            // Procesar preview incluso si el transport está detenido
+            self.preview_player.process(samples);
+            let peak = samples.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
+            let peak = if peak.is_finite() { peak } else { 0.0 };
+            self.output_level_bits.store(peak.to_bits(), Ordering::Relaxed);
             self.position_clock.store(self.transport.sample_count, Ordering::Relaxed);
             return;
         }
+        if self.preview_player.is_playing() {
+            self.preview_player.stop();
+        }
 
         let buffer_frames = (samples.len() / num_channels) as u64;
+        if buffer_frames == 0 {
+            self.output_level_bits.store(0.0f32.to_bits(), Ordering::Relaxed);
+            return;
+        }
         let frame_start = self.transport.sample_count;
         let frame_end = frame_start + buffer_frames;
+        // Reloj lineal de voces (sin wrap): base de `voice_frame_linear`.
+        let abs_start = self.absolute_frame;
+        // Copia local: el wrap es función pura del transporte.
+        let transport = self.transport;
+        let mode = self.mode;
 
         // MEZCLA MULTIPISTA
         // El wrap del loop global se aplica ACÁ, en el callback de audio,
         // frame a frame vía `transport.wrap_sample_count` (dueño único).
         // Así engine y GUI (que deriva el playhead del `position_clock`)
         // ven exactamente el mismo reloj, sin Seek espurios desde la GUI.
-        for clip in &self.clips {
-            let clip_frame_end = clip.start_frame + clip.duration_frames;
-
-            if self.mode == EngineMode::OpenStudio {
+        //
+        // CATEGÓRICO (bug compás 5→7): sin loop de clip activo y pasado
+        // el final, la voz retorna 0.0 y se duerme (`is_playing = false` /
+        // `VoiceState::Finished`). Jamás `elapsed % len`.
+        for clip in self.clips.iter_mut() {
+            if mode == EngineMode::OpenStudio {
+                let clip_frame_end = clip.start_frame.saturating_add(clip.duration_frames);
+                let offset_frames = clip.sample_offset / clip.channels.max(1);
                 for f in 0..buffer_frames as usize {
-                    let global_frame = self.transport.wrap_sample_count(frame_start + f as u64);
-                    if global_frame >= clip.start_frame && global_frame < clip_frame_end {
-                        let relative_frame = (global_frame - clip.start_frame) as usize;
-                        let sample_index_frame = (clip.sample_offset / clip.channels) + relative_frame;
-                        let clip_sample_l = sample_index_frame * clip.channels;
-                        let clip_sample_r = if clip.channels > 1 { clip_sample_l + 1 } else { clip_sample_l };
-
-                        let out_l_idx = f * num_channels;
-                        let out_r_idx = out_l_idx + 1;
-
-                        if clip_sample_l < clip.samples.len() {
-                            samples[out_l_idx] += clip.samples[clip_sample_l];
-                        }
-                        if clip.channels > 1 && clip_sample_r < clip.samples.len() {
-                            samples[out_r_idx] += clip.samples[clip_sample_r];
-                        } else if clip.channels == 1 && clip_sample_l < clip.samples.len() {
-                            samples[out_r_idx] += clip.samples[clip_sample_l];
-                        }
+                    let global_frame = transport.wrap_sample_count(frame_start + f as u64);
+                    if global_frame < clip.start_frame || global_frame >= clip_frame_end {
+                        // Transporte en área sin datos → silencio (0.0 ya
+                        // presente por el fill). Sin lectura, sin módulo.
+                        continue;
                     }
+                    let relative_frame = (global_frame - clip.start_frame) as usize;
+                    let src_frame = offset_frames.saturating_add(relative_frame);
+                    // Corte categórico: pasado el natural → 0.0, sin OOB.
+                    let l = clip.read_sample(src_frame);
+                    if l == 0.0 {
+                        // `read_sample` ya devolvió silencio (OOB o no
+                        // finito): no sumar nada, voz terminada en este
+                        // frame. El 0.0 del fill queda intacto.
+                        // Chequear también R para no dejar medio frame.
+                        let r = clip.read_sample_r(src_frame);
+                        if r == 0.0 {
+                            continue;
+                        }
+                        let out_r_idx = f * num_channels + 1;
+                        samples[out_r_idx] += r;
+                        continue;
+                    }
+                    let r = clip.read_sample_r(src_frame);
+                    let out_l_idx = f * num_channels;
+                    let out_r_idx = out_l_idx + 1;
+                    samples[out_l_idx] += l;
+                    samples[out_r_idx] += r;
                 }
             } else {
                 if !clip.is_playing {
                     continue;
                 }
 
-                // Longitud efectiva dinámica: loop individual si es válido,
-                // si no la duración REAL del audio. Nunca 1 compás fijo.
-                let natural = clip.natural_frames();
-                let loop_valid = clip.has_valid_clip_loop();
-                let loop_start = clip.clip_loop_start.min(natural);
-                let loop_end = clip.clip_loop_end.min(natural.max(1)).max(loop_start + 1);
-                let loop_len = loop_end.saturating_sub(loop_start).max(1);
-                if natural == 0 {
-                    continue;
-                }
+                // Voz OpenLive sobre reloj LINEAL (`absolute_frame`):
+                // REGLA DEL CLIP MANDA — solo `clip_loop_enabled == true`
+                // loopea. El Time Selection (loop global) mueve el cursor
+                // pero NUNCA re-emite ni extiende la voz: con el cursor
+                // loopeando en una región más corta que el clip, el
+                // `elapsed` lineal igual supera la emisión y la voz muta a
+                // (0.0, 0.0) en los compases 10..15 y se duerme
+                // (`is_playing = false`). Jamás `elapsed % len` global.
+                let offset_frames = clip.sample_offset / clip.channels.max(1);
+                let emission = clip.emission_len_frames();
+                let mut clip_finished = false;
                 for f in 0..buffer_frames as usize {
-                    // Reloj global con wrap del loop del transporte.
-                    let pos = self.transport.wrap_sample_count(frame_start + f as u64);
-                    // La fase arranca en el disparo (`start_frame`), no en el
-                    // cero absoluto del transporte.
-                    if pos < clip.start_frame {
+                    let abs = abs_start + f as u64;
+
+                    // ── HARD-STOP irrefutable ──────────────────────────
+                    // Si no hay loop de clip Y el frame lineal ya pasó el
+                    // final de la emisión → silencio inmediato + break.
+                    // NO se procesa interpolate, NO se lee buffer, NO se
+                    // evalúa condición alguna. El fill(0.0) del bloque ya
+                    // garantiza ceros; solo cortamos la iteración.
+                    if !clip.has_valid_clip_loop() && abs >= clip.start_absolute {
+                        let elapsed = abs - clip.start_absolute;
+                        if elapsed >= emission {
+                            clip_finished = true;
+                            break;
+                        }
+                    }
+
+                    let Some(relative_frame) = clip.voice_frame_linear(abs) else {
+                        continue;
+                    };
+
+                    let src_frame = offset_frames.saturating_add(relative_frame);
+                    let l = clip.read_sample(src_frame);
+                    let r = clip.read_sample_r(src_frame);
+                    if l == 0.0 && r == 0.0 {
                         continue;
                     }
-                    let elapsed = pos - clip.start_frame;
-                    let relative_frame = if loop_valid {
-                        if elapsed < loop_end {
-                            elapsed
-                        } else {
-                            loop_start + ((elapsed - loop_start) % loop_len)
-                        }
-                    } else {
-                        elapsed % natural
-                    } as usize;
-
-                    let clip_sample_l = relative_frame * clip.channels;
-                    let clip_sample_r = if clip.channels > 1 { clip_sample_l + 1 } else { clip_sample_l };
-
                     let out_l_idx = f * num_channels;
                     let out_r_idx = out_l_idx + 1;
-
-                    if clip_sample_l < clip.samples.len() {
-                        samples[out_l_idx] += clip.samples[clip_sample_l];
-                    }
-                    if clip.channels > 1 && clip_sample_r < clip.samples.len() {
-                        samples[out_r_idx] += clip.samples[clip_sample_r];
-                    } else if clip.channels == 1 && clip_sample_l < clip.samples.len() {
-                        samples[out_r_idx] += clip.samples[clip_sample_l];
-                    }
+                    samples[out_l_idx] += l;
+                    samples[out_r_idx] += r;
+                }
+                if clip_finished {
+                    clip.is_playing = false;
                 }
             }
         }
 
+        // Pico real del bloque para el vúmetro: 0.0 == -inf dB.
+        let mut peak = 0.0f32;
+        for &s in samples.iter() {
+            if s.is_finite() {
+                let a = s.abs();
+                if a > peak {
+                    peak = a;
+                }
+            }
+        }
+        self.output_level_bits.store(peak.to_bits(), Ordering::Relaxed);
+
         // Avance con wrap: el cursor (GUI vía `position_clock`) coincide
-        // exactamente con lo que el motor mezcló en este buffer.
+        // con la región mezclada en OpenStudio; en OpenLive las voces
+        // viven en el reloj lineal (`absolute_frame`, sin wrap) para que
+        // el Time Selection jamás las re-emita.
         self.transport.sample_count = self.transport.wrap_sample_count(frame_end);
+        self.absolute_frame = self.absolute_frame.saturating_add(buffer_frames);
         self.position_clock.store(self.transport.sample_count, Ordering::Relaxed);
     }
 }
@@ -523,6 +854,34 @@ mod tests {
     }
 
     #[test]
+    fn voice_frame_mutes_past_natural_without_clip_loop() {
+        // Exigencia #1: sin loop por clip → None al superar la muestra
+        // (el runner suma 0.0), nunca `elapsed % natural`.
+        let mut engine = test_engine();
+        engine.set_mode(EngineMode::OpenLive);
+        engine.add_clip(1, 0, 0, vec![0.5f32; 1000 * 2], 0.0, 0.0, 0.0, 2);
+        let t = engine.transport;
+        assert!(!engine.clips[0].has_valid_clip_loop());
+        assert_eq!(engine.clips[0].voice_frame(0, &t), Some(0));
+        assert_eq!(engine.clips[0].voice_frame(999, &t), Some(999));
+        assert_eq!(engine.clips[0].voice_frame(1000, &t), None);
+        assert_eq!(engine.clips[0].voice_frame(5000, &t), None);
+    }
+
+    #[test]
+    fn voice_frame_with_explicit_clip_loop_wraps() {
+        // Exigencia #2: CON loop explícito sí se repite dentro de su región.
+        let mut engine = test_engine();
+        engine.set_mode(EngineMode::OpenLive);
+        engine.add_clip(1, 0, 0, vec![0.5f32; 1000 * 2], 0.0, 0.0, 0.0, 2);
+        engine.set_clip_loop(0, 0, 0.0, 0.25, true);
+        assert!(engine.clips[0].has_valid_clip_loop());
+        let t = engine.transport;
+        let wrapped = engine.clips[0].voice_frame(5000, &t).unwrap();
+        assert!((0..1000).contains(&(wrapped as u64)));
+    }
+
+    #[test]
     fn clip_loop_region_is_honored() {
         let mut engine = test_engine();
         engine.set_mode(EngineMode::OpenLive);
@@ -537,5 +896,322 @@ mod tests {
         engine.set_clip_loop(0, 0, 0.0, 0.0, false);
         assert!(!engine.clips[0].has_valid_clip_loop());
         assert_eq!(engine.clips[0].playback_length_frames(), 44100);
+    }
+
+    #[test]
+    fn play_stops_preview_immediately() {
+        // FUGA #1: Play global debe hacer stop() del preview (buffer limpio,
+        // flag abajo) para que no se mezcle con el Master Mixer.
+        let mut engine = test_engine();
+        engine.preview_player.play(vec![0.5f32; 1024]);
+        assert!(engine.preview_player.is_playing());
+        engine.play();
+        assert!(!engine.preview_player.is_playing());
+    }
+
+    #[test]
+    fn process_in_playing_never_mixes_preview() {
+        // FUGA #1: aunque un PreviewSample tardío llegue tras el Play, el
+        // gate en process() impide la mezcla: sin clips, el bloque queda en
+        // silencio absoluto y el vúmetro cae a 0.0 (-inf dB).
+        let mut engine = test_engine();
+        engine.preview_player.play(vec![0.5f32; 4096]);
+        engine.play();
+        // Simular PreviewSample tardío (mpsc) DESPUÉS del Play.
+        engine.preview_player.play(vec![0.5f32; 4096]);
+        assert!(engine.preview_player.is_playing());
+        let mut raw = vec![0.777f32; 512 * 2];
+        let mut buf = AudioBuffer::new(&mut raw);
+        engine.process(&mut buf);
+        let peak = raw.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
+        assert_eq!(peak, 0.0, "preview fugado al Master Mixer durante Playing");
+        assert_eq!(engine.output_peak(), 0.0);
+        assert_eq!(engine.output_db(), f32::NEG_INFINITY);
+        // El preview tardío se descarta, no queda encolado.
+        assert!(!engine.preview_player.is_playing());
+    }
+
+    #[test]
+    fn clip_length_frames_uses_real_transport_tempo() {
+        // FUGA #2: 4 beats (1 compás, 3840 ticks) a 120 BPM vs 135 BPM dan
+        // longitudes distintas; el Clip Editor debe usar el tempo real.
+        let mut engine = test_engine();
+        engine.transport.set_bpm(120.0);
+        let len_120 = engine.transport.clip_length_frames(3840);
+        engine.transport.set_bpm(135.0);
+        let len_135 = engine.transport.clip_length_frames(3840);
+        assert_ne!(len_120, len_135);
+        // A 44100 Hz: 2s @120 vs 1.777s @135.
+        assert_eq!(len_120, 88200);
+        assert_eq!(len_135, 78400);
+        assert_eq!(len_135, engine.transport.ticks_to_samples(3840));
+    }
+
+    /// REGLA DEL CLIP MANDA: clip de 9 compases sin `clip_loop_enabled`,
+    /// con Time Selection de 15 compases loopeando el cursor. Del compás
+    /// 10 al 15 la voz devuelve (0.0, 0.0): -inf dB y voz dormida.
+    #[test]
+    fn openlive_bar10_is_silent_with_15bar_time_selection() {
+        let mut engine = test_engine();
+        engine.set_mode(EngineMode::OpenLive);
+        let spb = engine.transport.samples_per_bar();
+        let bar_frames = spb.round() as u64;
+        let nine_bars = bar_frames * 9;
+        let fifteen_bars = bar_frames * 15;
+        // Sample audible constante: cualquier re-emisión se detecta.
+        engine.add_clip(
+            1, 0, 0,
+            vec![0.5f32; (nine_bars as usize) * 2],
+            0.0, 0.0, 0.0, 2,
+        );
+        assert!(!engine.clips[0].has_valid_clip_loop());
+        engine.set_global_loop(0, fifteen_bars, true);
+        engine.trigger_clip(0, 0);
+        engine.play();
+        // Renderizar los 9 compases del clip (voz viva, se descarta).
+        let mut remaining = nine_bars;
+        while remaining > 0 {
+            let step = remaining.min(512);
+            run_frames(&mut engine, step);
+            remaining -= step;
+        }
+        // Compás 10: un bloque envenenado con basura debe salir en 0.0.
+        let mut raw = vec![0.777f32; 512 * 2];
+        let mut buf = AudioBuffer::new(&mut raw);
+        engine.process(&mut buf);
+        let peak = raw.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
+        assert_eq!(peak, 0.0, "compás 10 debe mutar a (0.0, 0.0)");
+        assert_eq!(engine.output_peak(), 0.0);
+        assert_eq!(engine.output_db(), f32::NEG_INFINITY);
+        assert!(
+            !engine.clips[0].is_playing,
+            "voz agotada sin clip-loop debe dormir aunque el cursor loopee"
+        );
+    }
+
+    /// Time Selection MÁS CORTO que el clip (4 compases vs 9): el wrap del
+    /// cursor no debe mantener la voz viva para siempre. A los 9 compases
+    /// lineales la voz muere igual.
+    #[test]
+    fn openlive_short_time_selection_does_not_extend_voice() {
+        let mut engine = test_engine();
+        engine.set_mode(EngineMode::OpenLive);
+        let spb = engine.transport.samples_per_bar();
+        let bar_frames = spb.round() as u64;
+        let nine_bars = bar_frames * 9;
+        engine.add_clip(
+            1, 0, 0,
+            vec![0.5f32; (nine_bars as usize) * 2],
+            0.0, 0.0, 0.0, 2,
+        );
+        engine.set_global_loop(0, bar_frames * 4, true);
+        engine.trigger_clip(0, 0);
+        engine.play();
+        // El cursor jamás sale de los compases 1..4 (wrap), pero la voz
+        // lineal se agota a los 9 compases: procesar 10 compases lineales.
+        let mut remaining = bar_frames * 10;
+        let mut last_peak = 1.0f32;
+        while remaining > 0 {
+            let step = remaining.min(512);
+            let mut raw = vec![0.0f32; (step * 2) as usize];
+            let mut buf = AudioBuffer::new(&mut raw);
+            engine.process(&mut buf);
+            last_peak = raw.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
+            remaining -= step;
+        }
+        assert_eq!(last_peak, 0.0, "voz lineal agotada: silencio aunque el cursor loopee");
+        assert!(!engine.clips[0].is_playing);
+        assert_eq!(engine.output_db(), f32::NEG_INFINITY);
+    }
+
+    /// Excepción explícita: CON `clip_loop_enabled` la voz sí sigue
+    /// sonando pasado el compás 9 (el loop del clip manda).
+    #[test]
+    fn openlive_explicit_clip_loop_keeps_sounding_past_bar9() {
+        let mut engine = test_engine();
+        engine.set_mode(EngineMode::OpenLive);
+        let spb = engine.transport.samples_per_bar();
+        let bar_frames = spb.round() as u64;
+        let nine_bars = bar_frames * 9;
+        engine.add_clip(
+            1, 0, 0,
+            vec![0.5f32; (nine_bars as usize) * 2],
+            0.0, 0.0, 0.0, 2,
+        );
+        // Loop individual de 1 compás al inicio del clip.
+        let sr = engine.sample_rate;
+        engine.set_clip_loop(0, 0, 0.0, (bar_frames as f32 / sr) as f32, true);
+        assert!(engine.clips[0].has_valid_clip_loop());
+        engine.set_global_loop(0, bar_frames * 15, true);
+        engine.trigger_clip(0, 0);
+        engine.play();
+        // Renderizar 10 compases lineales: la voz con loop sigue viva.
+        let mut remaining = bar_frames * 10;
+        let mut last_peak = 0.0f32;
+        while remaining > 0 {
+            let step = remaining.min(512);
+            let mut raw = vec![0.0f32; (step * 2) as usize];
+            let mut buf = AudioBuffer::new(&mut raw);
+            engine.process(&mut buf);
+            last_peak = raw.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
+            remaining -= step;
+        }
+        assert_eq!(last_peak, 0.5);
+        assert!(engine.clips[0].is_playing);
+    }
+
+    /// Bug 1 (alineación): disparo de celda desde el compás 1 → el primer
+    /// frame renderizado DEBE ser el sample 0 del clip (rampa distintiva
+    /// para detectar cualquier offset). Vale para trigger-then-play,
+    /// play-then-trigger a mitad de compás y re-disparo tras Stop.
+    #[test]
+    fn openlive_trigger_starts_at_sample_zero() {
+        for flow in 0..3 {
+            let mut engine = test_engine();
+            engine.set_mode(EngineMode::OpenLive);
+            let n = 8192u64;
+            let mut samples = Vec::with_capacity((n * 2) as usize);
+            for i in 0..n {
+                let v = i as f32 / n as f32;
+                samples.push(v);
+                samples.push(v);
+            }
+            engine.add_clip(1, 0, 0, samples, 0.0, 0.0, 0.0, 2);
+            match flow {
+                // 0: trigger y después Play (pad y luego transporte).
+                0 => {
+                    engine.trigger_clip(0, 0);
+                    engine.play();
+                }
+                // 1: Play primero y trigger a mitad del compás 3.
+                1 => {
+                    engine.play();
+                    run_frames(&mut engine, 200_000);
+                    engine.trigger_clip(0, 0);
+                }
+                // 2: ciclo Stop → trigger → Play de nuevo.
+                _ => {
+                    engine.trigger_clip(0, 0);
+                    engine.play();
+                    run_frames(&mut engine, 1000);
+                    engine.stop();
+                    engine.trigger_clip(0, 0);
+                    engine.trigger_clip(0, 0);
+                    engine.play();
+                }
+            }
+            let mut raw = vec![0.0f32; 512 * 2];
+            let mut buf = AudioBuffer::new(&mut raw);
+            engine.process(&mut buf);
+            for f in 0..512usize {
+                let expect = f as f32 / n as f32;
+                assert!(
+                    (raw[f * 2] - expect).abs() < 1e-6,
+                    "flow {}: frame L{} = {} (esperado {})",
+                    flow, f, raw[f * 2], expect
+                );
+                assert!(
+                    (raw[f * 2 + 1] - expect).abs() < 1e-6,
+                    "flow {}: frame R{} = {} (esperado {})",
+                    flow, f, raw[f * 2 + 1], expect
+                );
+            }
+        }
+    }
+
+    /// Bug 2 (cierre estricto): `current_frame >= total` sin loop → la voz
+    /// pasa a Finished, el puntero se detiene y todo frame posterior es
+    /// (0.0, 0.0), con -inf dB publicado.
+    #[test]
+    fn openlive_strict_close_past_native_length() {
+        let mut engine = test_engine();
+        engine.set_mode(EngineMode::OpenLive);
+        let n = 4096u64;
+        engine.add_clip(1, 0, 0, vec![0.5f32; (n * 2) as usize], 0.0, 0.0, 0.0, 2);
+        engine.trigger_clip(0, 0);
+        engine.play();
+        // Renderizar EXACTAMENTE la longitud nativa.
+        let mut remaining = n;
+        while remaining > 0 {
+            let step = remaining.min(512);
+            run_frames(&mut engine, step);
+            remaining -= step;
+        }
+        // Tres bloques más allá del final: silencio total y voz dormida.
+        for _ in 0..3 {
+            let mut raw = vec![0.777f32; 512 * 2];
+            let mut buf = AudioBuffer::new(&mut raw);
+            engine.process(&mut buf);
+            let peak = raw.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
+            assert_eq!(peak, 0.0, "más allá del nativo debe ser (0.0, 0.0)");
+        }
+        assert!(!engine.clips[0].is_playing);
+        assert_eq!(engine.output_db(), f32::NEG_INFINITY);
+    }
+
+    /// OpenStudio desde el compás 1: clip en tick 0 + cursor en 0 → el
+    /// primer frame es el sample 0, y pasado el final timeline hay silencio.
+    #[test]
+    fn openstudio_bar1_starts_at_sample_zero_and_ends_silent() {
+        let mut engine = test_engine();
+        engine.set_mode(EngineMode::OpenStudio);
+        let n = 4096u64;
+        let mut samples = Vec::with_capacity((n * 2) as usize);
+        for i in 0..n {
+            let v = i as f32 / n as f32;
+            samples.push(v);
+            samples.push(v);
+        }
+        let duration_secs = n as f32 / engine.sample_rate;
+        engine.add_clip(1, 0, 0, samples, 0.0, duration_secs, 0.0, 2);
+        engine.transport.sample_count = 0;
+        engine.play();
+        let mut raw = vec![0.0f32; 512 * 2];
+        let mut buf = AudioBuffer::new(&mut raw);
+        engine.process(&mut buf);
+        for f in 0..512usize {
+            let expect = f as f32 / n as f32;
+            assert!(
+                (raw[f * 2] - expect).abs() < 1e-6,
+                "frame L{} = {} (esperado {})",
+                f, raw[f * 2], expect
+            );
+        }
+        // Agotar el clip y confirmar silencio posterior.
+        let mut remaining = n;
+        while remaining > 0 {
+            let step = remaining.min(512);
+            run_frames(&mut engine, step);
+            remaining -= step;
+        }
+        let mut raw = vec![0.777f32; 512 * 2];
+        let mut buf = AudioBuffer::new(&mut raw);
+        engine.process(&mut buf);
+        let peak = raw.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
+        assert_eq!(peak, 0.0);
+        assert_eq!(engine.output_db(), f32::NEG_INFINITY);
+    }
+
+    /// El elapsed de la voz es lineal desde el trigger (0 al disparar),
+    /// independiente del cursor global: base de la aguja del editor.
+    #[test]
+    fn voice_elapsed_frames_tracks_linear_voice_clock() {
+        let mut engine = test_engine();
+        engine.set_mode(EngineMode::OpenLive);
+        engine.add_clip(1, 0, 0, vec![0.5f32; 8192 * 2], 0.0, 0.0, 0.0, 2);
+        // Sin voz: None (fallback al cursor global).
+        assert_eq!(engine.voice_elapsed_frames(0, 0), None);
+        assert_eq!(engine.voice_elapsed_frames(9, 9), None);
+        engine.trigger_clip(0, 0);
+        // Recién disparada: 0 aunque el cursor global esté en otro lado.
+        engine.transport.sample_count = 200_000;
+        assert_eq!(engine.voice_elapsed_frames(0, 0), Some(0));
+        engine.play();
+        run_frames(&mut engine, 512);
+        // Avanza con los frames renderizados, no con el cursor.
+        assert_eq!(engine.voice_elapsed_frames(0, 0), Some(512));
+        // Cursor con wrap del Time Selection no la mueve.
+        engine.transport.sample_count = 0;
+        assert_eq!(engine.voice_elapsed_frames(0, 0), Some(512));
     }
 }

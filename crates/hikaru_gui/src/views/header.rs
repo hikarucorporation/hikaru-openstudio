@@ -80,23 +80,45 @@ pub fn show(
                 if ui.add_sized(btn_size, Button::new(RichText::new("▶").size(16.0).color(play_txt)).fill(play_bg)).clicked() {
                     transport.playback_state = TransportPlaybackState::Playing;
 
+                    // FUGA #1: detener el preview del explorer ANTES del Play
+                    // global para que su buffer no se mezcle con el Master
+                    // Mixer durante la reproducción del timeline. El engine
+                    // también hace `stop()` en `play()` + gate en `process()`;
+                    // este `StopPreview` es la orden sincrónica GUI -> motor.
+                    audio_proxy.send(GuiCommand::StopPreview);
+                    // FUGA #2: sincronizar BPM de forma SINCRÓNICA antes de
+                    // convertir ticks->secs y antes del Seek/Play. Sin esto el
+                    // engine seguía con el tempo viejo mientras la GUI ya
+                    // calculaba `clip_length` con el nuevo (ej. clip 135 BPM
+                    // vs proyecto 120 BPM): los compases visuales del Clip
+                    // Editor no coincidían con la parada real del engine.
+                    audio_proxy.send(GuiCommand::SetBpm(transport.bpm as f32));
+
                     match *mode {
                         AppMode::OpenStudio => {
-                            // En Studio sincronizamos los clips lineales del timeline
-                            let bpm = transport.bpm as f32;
-                            let seconds_per_tick = 60.0 / (bpm * playlist_state.ppqn as f32);
-
+                            // En Studio sincronizamos los clips lineales del timeline.
+                            // Longitud en frames (`clip_length_frames` del engine)
+                            // derivada del tempo REAL del transporte vía
+                            // `ticks_to_samples`: compases visuales == parada
+                            // del engine, sin deriva f32 manual.
+                            let sr = transport.sample_rate.get().max(1.0);
                             let clips_to_sync: Vec<AudioClipData> = playlist_state
                                 .clips
                                 .iter()
                                 .filter_map(|(track_id, clip)| {
                                     if let ClipType::Audio { sample_path, sample_offset_ticks, .. } = &clip.clip_type {
+                                        // `clip_length_frames` usa BPM activo + SR
+                                        // real + PPQN único: idéntico al que el
+                                        // engine usará tras el `SetBpm` de arriba.
+                                        // Compases visuales == parada del engine.
+                                        let clip_length_frames = transport.clip_length_frames(clip.duration_ticks);
+                                        let duration_secs = clip_length_frames as f32 / sr;
                                         Some(AudioClipData {
                                             clip_id: clip.id,
                                             path: sample_path.clone(),
-                                            start_secs: clip.start_tick as f32 * seconds_per_tick,
-                                            duration_secs: clip.duration_ticks as f32 * seconds_per_tick,
-                                            offset_secs: *sample_offset_ticks as f32 * seconds_per_tick,
+                                            start_secs: transport.ticks_to_samples(clip.start_tick) as f32 / sr,
+                                            duration_secs,
+                                            offset_secs: transport.ticks_to_samples(*sample_offset_ticks) as f32 / sr,
                                             track_index: *track_id,
                                         })
                                     } else {
@@ -128,6 +150,10 @@ pub fn show(
                         audio_proxy.send(GuiCommand::Pause);
                     } else if is_paused {
                         transport.playback_state = TransportPlaybackState::Playing;
+                        // Reanudar también silencia el preview y re-afirma el
+                        // BPM real antes del Play (mismas fugas #1/#2).
+                        audio_proxy.send(GuiCommand::StopPreview);
+                        audio_proxy.send(GuiCommand::SetBpm(transport.bpm as f32));
                         audio_proxy.send(GuiCommand::Play);
                     }
                 }

@@ -3,12 +3,13 @@
 // Código fuente del App
 // crates/hikaru_gui/src/app.rs
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use std::path::PathBuf;
 
 use egui::{CentralPanel, Color32, RichText, ScrollArea, TopBottomPanel, ViewportBuilder, ViewportId};
+use hikaru_audio_engine::AudioEngine;
 use hikaru_core::SampleRate;
 use hikaru_transport::{TransportPlaybackState, TransportPosition};
 
@@ -33,6 +34,10 @@ pub struct HikaruApp {
     pub mode: AppMode,
     pub transport: TransportPosition,
     pub position_clock: Arc<AtomicU64>,
+    /// Pico real de salida del engine (bits de f32, 0.0 == -inf dB).
+    /// El vúmetro del mixer lee ESTO, no el fader: en compases sin audio
+    /// marca -inf aunque el fader siga alto.
+    pub output_level_bits: Arc<AtomicU32>,
     pub is_looping: bool,
     pub cpu_usage: f32,
     /// Último BPM propagado al motor vía `GuiCommand::SetBpm`.
@@ -62,6 +67,10 @@ pub struct HikaruApp {
 
     pub audio_proxy: AudioProxy,
     pub _audio_stream: Option<cpal::Stream>,
+    /// Handle compartido al engine para el polling por frame de la Session
+    /// Matrix (`Playing` → `Stopped` cuando la voz termina). Se lee con
+    /// `try_lock` para no bloquear el callback de audio.
+    pub engine_handle: Option<Arc<Mutex<AudioEngine<'static>>>>,
 }
 
 impl HikaruApp {
@@ -70,6 +79,8 @@ impl HikaruApp {
         audio_proxy: AudioProxy,
         audio_stream: Option<cpal::Stream>,
         position_clock: Arc<AtomicU64>,
+        output_level_bits: Arc<AtomicU32>,
+        engine_handle: Option<Arc<Mutex<AudioEngine<'static>>>>,
     ) -> Self {
         let sample_rate = SampleRate::new(44100.0);
         let transport = TransportPosition::new(sample_rate, 140.0);
@@ -95,6 +106,7 @@ impl HikaruApp {
             mode: AppMode::OpenLive,
             transport,
             position_clock,
+            output_level_bits,
             is_looping: false,
             cpu_usage: 0.12,
             show_mixer: false,
@@ -118,10 +130,15 @@ impl HikaruApp {
             selected_track_index: 1,
             selected_slot_index: 0,
             fonts_configured: false,
-            bpm_synced_to_engine: 140.0,
+            // FUGA #2 (BPM): arrancar en valor imposible (-1.0) para forzar
+            // el primer `SetBpm` al engine en el primer frame. Con 140.0
+            // inicial nunca se sincronizaba (engine arranca en 128.0) y el
+            // cursor corría a un tempo y el audio a otro.
+            bpm_synced_to_engine: -1.0,
             global_loop_synced_to_engine: None,
             audio_proxy,
             _audio_stream: audio_stream,
+            engine_handle,
         }
     }
 
@@ -171,10 +188,27 @@ impl eframe::App for HikaruApp {
         // BPM dinámico: si el header cambió el BPM de la GUI, propagarlo al
         // motor UNA vez (no cada frame) para que audio y cursor usen el mismo
         // tempo. Sin esto el cursor corre a un tempo y el audio a otro.
+        // FUGA #2: el envío es sincrónico al cambio (antes del loop global,
+        // que deriva `ticks_to_samples` del mismo BPM), así `clip_length`
+        // en frames del engine coincide con los compases visuales.
+        // Ej.: clip a 135 BPM vs proyecto a 120 BPM -> la duración en
+        // frames se calcula con el tempo REAL del transporte
+        // (`ticks_to_samples`), no con un tempo rancio del engine.
         if (self.transport.bpm - self.bpm_synced_to_engine).abs() > f64::EPSILON {
             self.bpm_synced_to_engine = self.transport.bpm;
             self.audio_proxy
                 .send(GuiCommand::SetBpm(self.transport.bpm as f32));
+        }
+
+        // FUGA #1 (espejo GUI): si el transporte global está en Playing el
+        // preview del explorer ya fue detenido en el engine (`play()->stop()`
+        // + gate en `process()`). Apagar también el flag visual para que la
+        // waveform no siga animando el playhead sobre el Master Mixer.
+        if self.transport.playback_state == TransportPlaybackState::Playing
+            && self.explorer_state.is_playing_preview
+        {
+            self.explorer_state.is_playing_preview = false;
+            self.explorer_state.preview_position = 0.0;
         }
 
         if self.transport.playback_state == TransportPlaybackState::Playing {
@@ -313,6 +347,9 @@ impl eframe::App for HikaruApp {
         });
 
         CentralPanel::default().show(ctx, |ui| {
+            // Clon barato del handle (Arc) para el polling por frame sin
+            // pelear borrows con `matrix_state` dentro del closure.
+            let engine_handle = self.engine_handle.clone();
             match self.mode {
                 AppMode::OpenLive => {
                     // Tick exacto con PPQN único + BPM activo + SR real.
@@ -338,6 +375,7 @@ impl eframe::App for HikaruApp {
                         self.is_looping,
                         self.playlist_state.loop_start_ticks,
                         self.playlist_state.loop_end_ticks,
+                        engine_handle.as_ref(),
                     );
                 }
                 AppMode::OpenStudio => {
@@ -404,6 +442,10 @@ impl eframe::App for HikaruApp {
         });
 
         if self.show_mixer {
+            // Nivel real del engine: 0.0 en silencio == -inf dB.
+            let output_level =
+                f32::from_bits(self.output_level_bits.load(Ordering::Relaxed));
+            let output_level = if output_level.is_finite() { output_level } else { 0.0 };
             ctx.show_viewport_immediate(
                 ViewportId::from_hash_of("hikaru_mixer_viewport"),
                 ViewportBuilder::default()
@@ -416,7 +458,7 @@ impl eframe::App for HikaruApp {
                             AppMode::OpenLive => &mut self.live_tracks,
                             AppMode::OpenStudio => &mut self.studio_tracks,
                         };
-                        mixer::show(ui, active_tracks, &mut self.selected_track_index, &mut self.mode);
+                        mixer::show(ui, active_tracks, &mut self.selected_track_index, &mut self.mode, output_level);
                     });
                 },
             );

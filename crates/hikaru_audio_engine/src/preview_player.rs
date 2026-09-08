@@ -17,6 +17,10 @@ pub struct PreviewPlayer {
     /// Buffer interno de muestras mono f32 pre-alocadas.
     /// Se trunca o reemplaza en `play()`, nunca se redimensiona en `process()`.
     buffer: Vec<f32>,
+    /// Longitud válida cargada en `play()` (<= MAX_PREVIEW_SAMPLES).
+    /// `process()` muteará/frenará al alcanzar este límite, no al final del
+    /// buffer pre-alocado (que contiene ceros de relleno).
+    length: usize,
     /// Índice de la muestra actual en reproducción.
     position: usize,
     /// Factor de ganancia lineal: 0.0 = silencio absoluto, 1.0 = volumen máximo.
@@ -33,6 +37,7 @@ impl PreviewPlayer {
 
         Self {
             buffer,
+            length: 0,
             position: 0,
             volume: 0.8,
             is_playing: false,
@@ -64,7 +69,8 @@ impl PreviewPlayer {
         }
 
         self.position = 0;
-        self.is_playing = true;
+        self.length = len;
+        self.is_playing = len > 0;
     }
 
     /// Detiene la reproducción, resetea la posición a cero y limpia el estado.
@@ -74,7 +80,14 @@ impl PreviewPlayer {
     pub fn stop(&mut self) {
         self.is_playing = false;
         self.position = 0;
+        self.length = 0;
         self.buffer.fill(0.0);
+    }
+
+    /// Indica si hay preview sonando (para el gate del Master Mixer).
+    #[inline]
+    pub fn is_playing(&self) -> bool {
+        self.is_playing
     }
 
     /// Callback de procesamiento de audio — ejecutado en el hilo de CPAL.
@@ -90,11 +103,11 @@ impl PreviewPlayer {
             return;
         }
 
-        let buf_len = self.buffer.len();
+        let active_len = self.length.min(self.buffer.len());
         let vol = self.volume;
 
         for frame in output.iter_mut() {
-            if self.position < buf_len {
+            if self.position < active_len {
                 // Mezcla aditiva: sumamos al frame existente para permitir
                 // superposición con otras fuentes en el motor maestro.
                 *frame += self.buffer[self.position] * vol;
