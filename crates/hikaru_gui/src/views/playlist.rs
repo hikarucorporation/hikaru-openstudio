@@ -155,6 +155,22 @@ impl PlaylistState {
         self.loop_region_active && self.loop_end_ticks > self.loop_start_ticks
     }
 
+    /// Limpia completamente la región de loop (time selection).
+    /// Resetea todos los campos relacionados y marca
+    /// `loop_drag_completed_this_frame = true` para que el consumidor
+    /// (app.rs / matrix.rs) propague la desactivación al engine.
+    pub fn clear_loop_region(&mut self) {
+        self.loop_start_ticks = 0;
+        self.loop_end_ticks = 0;
+        self.loop_region_active = false;
+        self.loop_dragging = false;
+        self.loop_preview_start_ticks = 0;
+        self.loop_preview_end_ticks = 0;
+        self.loop_preview_active = false;
+        self.loop_drag_handle = LoopDragHandle::None;
+        self.loop_drag_completed_this_frame = true;
+    }
+
     /// Final del último clip en la Playlist en ticks (0 si no hay clips).
     /// Estilo REAPER: el loop por defecto abarca hasta el final del proyecto.
     pub fn total_project_ticks(&self) -> u64 {
@@ -967,6 +983,8 @@ fn show_impl(
                             // En Arranger solo cuando el botón de loop del transporte
                             // está ENCENDIDO; en ClipEditor (OPENLIVE) siempre, para
                             // el loop individual del clip.
+                            // Alt + Click o Alt + Drag sobre la regla limpia
+                            // (elimina) la selección de loop activa.
                             // PATRÓN MATRIX (anti-congelamiento): durante `.dragged()`
                             // SOLO se actualiza el rectángulo translúcido visual
                             // (`loop_preview_*`), SIN tocar `loop_start_ticks` /
@@ -976,8 +994,20 @@ fn show_impl(
                             // `loop_drag_completed_this_frame`.
                             {
                                 let shift_pressed = ui.input(|i| i.modifiers.shift);
+                                let alt_pressed = ui.input(|i| i.modifiers.alt);
                                 let allow_loop_select = loop_enabled
                                     || matches!(mode, ViewMode::ClipEditor { .. });
+
+                                // --- ALT + CLICK/DRAG: LIMPIAR TIME SELECTION ---
+                                // Si Alt está presionado y hay una región de loop
+                                // activa, limpiar inmediatamente al hacer click
+                                // o arrastrar sobre la regla.
+                                if alt_pressed
+                                    && (ruler_response.clicked() || ruler_response.dragged())
+                                    && state.loop_region_active
+                                {
+                                    state.clear_loop_region();
+                                }
 
                                 // --- RESIZE DE EXTREMOS ESTILO REAPER ---
                                 // Hitboxes de ~6px en cada borde para arrastrar
