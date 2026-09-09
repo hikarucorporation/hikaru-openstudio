@@ -194,6 +194,9 @@ pub struct HikaruApp {
     /// Matrix (`Playing` → `Stopped` cuando la voz termina). Se lee con
     /// `try_lock` para no bloquear el callback de audio.
     pub engine_handle: Option<Arc<Mutex<AudioEngine<'static>>>>,
+    /// Peaks por pista: clones de los `Arc<AtomicU32>` del engine.
+    /// El mixer lee estos valores para los VU meters individuales.
+    pub track_peak_bits: Vec<Arc<AtomicU32>>,
 }
 
 impl HikaruApp {
@@ -232,6 +235,17 @@ impl HikaruApp {
             t.volume = 0.70;
         }
 
+        // Extraer clones de los Arc<AtomicU32> de peaks por pista del engine.
+        let track_peak_bits_init: Vec<Arc<AtomicU32>> = if let Some(ref handle) = engine_handle {
+            if let Ok(engine) = handle.try_lock() {
+                engine.track_peak_bits.iter().map(|a| Arc::clone(a)).collect()
+            } else {
+                (0..16).map(|_| Arc::new(AtomicU32::new(0.0f32.to_bits()))).collect()
+            }
+        } else {
+            (0..16).map(|_| Arc::new(AtomicU32::new(0.0f32.to_bits()))).collect()
+        };
+
         Self {
             mode: AppMode::OpenLive,
             transport,
@@ -269,6 +283,7 @@ impl HikaruApp {
             audio_proxy,
             _audio_stream: audio_stream,
             engine_handle,
+            track_peak_bits: track_peak_bits_init,
         }
     }
 
@@ -577,6 +592,13 @@ impl eframe::App for HikaruApp {
                 f32::from_bits(self.output_level_bits.load(Ordering::Relaxed));
             let output_level = if output_level.is_finite() { output_level } else { 0.0 };
 
+            // Leer peaks por pista desde los Arc<AtomicU32> del engine.
+            let mut track_peaks = [0.0f32; 16];
+            for (i, arc) in self.track_peak_bits.iter().enumerate().take(16) {
+                let val = f32::from_bits(arc.load(Ordering::Relaxed));
+                track_peaks[i] = if val.is_finite() { val } else { 0.0 };
+            }
+
             // SYNC PRE-MIXER: capturar estado viejo de la matrix
             let old_matrix: Vec<matrix::TrackMeta> = if self.mode == AppMode::OpenLive {
                 self.matrix_state.tracks.clone()
@@ -601,7 +623,7 @@ impl eframe::App for HikaruApp {
                             AppMode::OpenLive => &mut self.live_tracks,
                             AppMode::OpenStudio => &mut self.studio_tracks,
                         };
-                        mixer::show(ui, active_tracks, &mut self.selected_track_index, &mut self.mode, output_level);
+                        mixer::show(ui, active_tracks, &mut self.selected_track_index, &mut self.mode, output_level, &track_peaks);
                     });
                 },
             );

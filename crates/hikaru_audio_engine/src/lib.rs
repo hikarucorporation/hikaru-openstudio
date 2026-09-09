@@ -53,6 +53,9 @@ pub struct AudioClipInstance {
     pub clip_loop_enabled: bool,
     pub clip_loop_start: u64,
     pub clip_loop_end: u64,
+    /// Clip cargado desde la Session Matrix (OpenLive).
+    /// `SyncPlaylistClips` NO debe eliminar estos clips al sincronizar.
+    pub is_matrix_clip: bool,
 }
 
 impl AudioClipInstance {
@@ -264,6 +267,13 @@ pub struct AudioEngine<'a> {
     /// La GUI lo lee para el vúmetro: 0.0 == silencio == -inf dB.
     /// Sin esto el vúmetro dibujaba el fader y mentía en áreas sin audio.
     pub output_level_bits: Arc<AtomicU32>,
+    /// Pico por pista (16 canales). Cada `AtomicU32` almacena el peak
+    /// (f32 bits) de ESA pista específica en el último bloque. El GUI los
+    /// lee para los VU meters individuales de la Mixer.
+    pub track_peak_bits: [Arc<AtomicU32>; 16],
+    /// Buffers scratch por pista para acumular señal aislada antes de la
+    /// mezcla final. Cada buffer es stereo (frames * 2).
+    track_output_bufs: Vec<Vec<f32>>,
     /// Per-track volume (0.0..1.0), indexado por track_index.
     /// 16 pistas máximas (TrackMatrix limit).
     pub track_volumes: [f32; 16],
@@ -292,6 +302,8 @@ impl<'a> AudioEngine<'a> {
             position_clock,
             absolute_frame: 0,
             output_level_bits: Arc::new(AtomicU32::new(0.0f32.to_bits())),
+            track_peak_bits: std::array::from_fn(|_| Arc::new(AtomicU32::new(0.0f32.to_bits()))),
+            track_output_bufs: vec![Vec::new(); 16],
             track_volumes: [0.75; 16],
             track_pans: [0.0; 16],
             track_mutes: [false; 16],
@@ -302,6 +314,15 @@ impl<'a> AudioEngine<'a> {
     /// Pico real del último bloque (0.0 == silencio absoluto).
     pub fn output_peak(&self) -> f32 {
         f32::from_bits(self.output_level_bits.load(Ordering::Relaxed))
+    }
+
+    /// Pico de una pista específica (0.0 si silencio).
+    pub fn track_peak(&self, track_idx: usize) -> f32 {
+        if track_idx < 16 {
+            f32::from_bits(self.track_peak_bits[track_idx].load(Ordering::Relaxed))
+        } else {
+            0.0
+        }
     }
 
     /// Nivel en dB del último bloque (-inf si es silencio).
@@ -434,6 +455,7 @@ impl<'a> AudioEngine<'a> {
         duration_secs: f32,
         offset_secs: f32,
         channels: usize,
+        is_matrix_clip: bool,
     ) {
         let ch = channels.max(1);
         let start_frame = (start_secs * self.sample_rate) as u64;
@@ -468,6 +490,7 @@ impl<'a> AudioEngine<'a> {
             clip_loop_enabled: false,
             clip_loop_start: 0,
             clip_loop_end: 0,
+            is_matrix_clip,
         };
 
         let is_studio = self.mode == EngineMode::OpenStudio;
@@ -644,32 +667,31 @@ impl<'a> AudioEngine<'a> {
         let samples = out_buffer.get_samples_mut();
         let num_channels = 2; // Estéreo
 
-        // Exigencia #2: el buffer del bloque actual se rellena
-        // explícitamente con ceros. El área sin datos de audio es
-        // silencio absoluto, nunca basura del callback anterior.
-        // El `continue` de las voces terminadas deja este 0.0 intacto.
+        // El buffer del bloque actual se rellena con ceros.
         samples.fill(0.0);
 
         // ── PREVIEW: SIEMPRE se mezcla si está activo ──
-        // Lee del `Arc<PreviewBuffer>` vía AtomicUsize cursor — cero locks.
-        // El decode thread carga datos y activa con `is_playing.store(true)`.
         let preview = self.preview_player.shared_buffer();
         preview.process(samples);
 
-        // ── CLIP MIXING: solo cuando el transporte reproduce ──
+        // ── CLIP MIXING con per-track peaks ──
         if self.transport.playback_state == TransportPlaybackState::Playing {
             let buffer_frames = (samples.len() / num_channels) as u64;
             if buffer_frames == 0 {
                 self.output_level_bits.store(0.0f32.to_bits(), Ordering::Relaxed);
+                for p in &self.track_peak_bits {
+                    p.store(0.0f32.to_bits(), Ordering::Relaxed);
+                }
                 return;
             }
+            let buf_len = samples.len();
             let frame_start = self.transport.sample_count;
             let frame_end = frame_start + buffer_frames;
             let abs_start = self.absolute_frame;
             let transport = self.transport;
             let mode = self.mode;
 
-            // Pre-compute per-track gain (volume + pan + mute/solo logic).
+            // Pre-compute per-track gain (volume + pan + mute/solo).
             let any_solo = self.track_solos.iter().any(|&s| s);
             let mut track_gain_l = [0.0f32; 16];
             let mut track_gain_r = [0.0f32; 16];
@@ -684,9 +706,7 @@ impl<'a> AudioEngine<'a> {
                 } else {
                     vol
                 };
-                // Linear pan law: center=unity, full L/R=crossfade.
-                // pan: -100 (L) .. 0 (C) .. +100 (R)
-                let pan_norm = self.track_pans[t] / 100.0; // -1..+1
+                let pan_norm = self.track_pans[t] / 100.0;
                 track_gain_l[t] = effective_gain * if pan_norm > 0.0 {
                     1.0 - pan_norm
                 } else {
@@ -699,10 +719,21 @@ impl<'a> AudioEngine<'a> {
                 };
             }
 
+            // Asegurar que los scratch buffers tengan el tamaño correcto.
+            for buf in self.track_output_bufs.iter_mut() {
+                if buf.len() != buf_len {
+                    buf.resize(buf_len, 0.0);
+                }
+                buf.fill(0.0);
+            }
+
+            // Acumular clips en scratch buffers por pista.
             for clip in self.clips.iter_mut() {
                 let ti = clip.track_index.min(15);
                 let gl = track_gain_l[ti];
                 let gr = track_gain_r[ti];
+                let track_buf = &mut self.track_output_bufs[ti];
+
                 if mode == EngineMode::OpenStudio {
                     let clip_frame_end = clip.start_frame.saturating_add(clip.duration_frames);
                     let offset_frames = clip.sample_offset / clip.channels.max(1);
@@ -719,15 +750,12 @@ impl<'a> AudioEngine<'a> {
                             if r == 0.0 {
                                 continue;
                             }
-                            let out_r_idx = f * num_channels + 1;
-                            samples[out_r_idx] += r;
+                            track_buf[f * 2 + 1] += r;
                             continue;
                         }
                         let r = clip.read_sample_r(src_frame) * gr;
-                        let out_l_idx = f * num_channels;
-                        let out_r_idx = out_l_idx + 1;
-                        samples[out_l_idx] += l;
-                        samples[out_r_idx] += r;
+                        track_buf[f * 2] += l;
+                        track_buf[f * 2 + 1] += r;
                     }
                 } else {
                     if !clip.is_playing {
@@ -758,10 +786,8 @@ impl<'a> AudioEngine<'a> {
                         if l == 0.0 && r == 0.0 {
                             continue;
                         }
-                        let out_l_idx = f * num_channels;
-                        let out_r_idx = out_l_idx + 1;
-                        samples[out_l_idx] += l;
-                        samples[out_r_idx] += r;
+                        track_buf[f * 2] += l;
+                        track_buf[f * 2 + 1] += r;
                     }
                     if clip_finished {
                         clip.is_playing = false;
@@ -769,11 +795,41 @@ impl<'a> AudioEngine<'a> {
                 }
             }
 
+            // Calcular peaks por pista y mezclar en output.
+            for t in 0..16 {
+                let track_buf = &self.track_output_bufs[t];
+
+                // Peak de esta pista (pre-master).
+                let mut track_peak = 0.0f32;
+                for &s in track_buf.iter() {
+                    if s.is_finite() {
+                        let a = s.abs();
+                        if a > track_peak {
+                            track_peak = a;
+                        }
+                    }
+                }
+                self.track_peak_bits[t].store(track_peak.to_bits(), Ordering::Relaxed);
+
+                // Mezclar scratch buffer → output.
+                for i in 0..buf_len {
+                    let v = track_buf[i];
+                    if v != 0.0 {
+                        samples[i] += v;
+                    }
+                }
+            }
+
             self.transport.sample_count = self.transport.wrap_sample_count(frame_end);
             self.absolute_frame = self.absolute_frame.saturating_add(buffer_frames);
+        } else {
+            // Transporte detenido: peaks en silencio.
+            for p in &self.track_peak_bits {
+                p.store(0.0f32.to_bits(), Ordering::Relaxed);
+            }
         }
 
-        // Pico real del bloque (preview + clips) para el vúmetro.
+        // Pico real del bloque (preview + clips mix) para el vúmetro master.
         let mut peak = 0.0f32;
         for &s in samples.iter() {
             if s.is_finite() {
@@ -819,7 +875,7 @@ mod tests {
         // 1s estéreo @44100: 44100 frames. duration_secs = 0 (como manda la
         // matriz al cargar) debe derivarse del audio real, no de 1 compás.
         let samples = vec![0.5f32; 44100 * 2];
-        engine.add_clip(1, 0, 0, samples, 0.0, 0.0, 0.0, 2);
+        engine.add_clip(1, 0, 0, samples, 0.0, 0.0, 0.0, 2, false);
         assert_eq!(engine.clips[0].duration_frames, 44100);
         assert_eq!(engine.clips[0].playback_length_frames(), 44100);
     }
@@ -829,7 +885,7 @@ mod tests {
         let mut engine = test_engine();
         engine.set_mode(EngineMode::OpenLive);
         engine.transport.sample_count = 8000;
-        engine.add_clip(1, 0, 0, vec![0.5f32; 100 * 2], 0.0, 0.0, 0.0, 2);
+        engine.add_clip(1, 0, 0, vec![0.5f32; 100 * 2], 0.0, 0.0, 0.0, 2, false);
         engine.trigger_clip(0, 0);
         assert!(engine.clips[0].is_playing);
         assert_eq!(engine.clips[0].start_frame, 8000);
@@ -842,9 +898,9 @@ mod tests {
     fn trigger_scene_plays_whole_row() {
         let mut engine = test_engine();
         engine.set_mode(EngineMode::OpenLive);
-        engine.add_clip(1, 0, 0, vec![0.5f32; 100 * 2], 0.0, 0.0, 0.0, 2);
-        engine.add_clip(2, 1, 0, vec![0.5f32; 100 * 2], 0.0, 0.0, 0.0, 2);
-        engine.add_clip(3, 0, 1, vec![0.5f32; 100 * 2], 0.0, 0.0, 0.0, 2);
+        engine.add_clip(1, 0, 0, vec![0.5f32; 100 * 2], 0.0, 0.0, 0.0, 2, false);
+        engine.add_clip(2, 1, 0, vec![0.5f32; 100 * 2], 0.0, 0.0, 0.0, 2, false);
+        engine.add_clip(3, 0, 1, vec![0.5f32; 100 * 2], 0.0, 0.0, 0.0, 2, false);
         engine.trigger_scene(1);
         assert!(!engine.clips[0].is_playing);
         assert!(!engine.clips[1].is_playing);
@@ -885,7 +941,7 @@ mod tests {
         // (el runner suma 0.0), nunca `elapsed % natural`.
         let mut engine = test_engine();
         engine.set_mode(EngineMode::OpenLive);
-        engine.add_clip(1, 0, 0, vec![0.5f32; 1000 * 2], 0.0, 0.0, 0.0, 2);
+        engine.add_clip(1, 0, 0, vec![0.5f32; 1000 * 2], 0.0, 0.0, 0.0, 2, false);
         let t = engine.transport;
         assert!(!engine.clips[0].has_valid_clip_loop());
         assert_eq!(engine.clips[0].voice_frame(0, &t), Some(0));
@@ -899,7 +955,7 @@ mod tests {
         // Exigencia #2: CON loop explícito sí se repite dentro de su región.
         let mut engine = test_engine();
         engine.set_mode(EngineMode::OpenLive);
-        engine.add_clip(1, 0, 0, vec![0.5f32; 1000 * 2], 0.0, 0.0, 0.0, 2);
+        engine.add_clip(1, 0, 0, vec![0.5f32; 1000 * 2], 0.0, 0.0, 0.0, 2, false);
         engine.set_clip_loop(0, 0, 0.0, 0.25, true);
         assert!(engine.clips[0].has_valid_clip_loop());
         let t = engine.transport;
@@ -911,7 +967,7 @@ mod tests {
     fn clip_loop_region_is_honored() {
         let mut engine = test_engine();
         engine.set_mode(EngineMode::OpenLive);
-        engine.add_clip(1, 0, 0, vec![0.5f32; 44100 * 2], 0.0, 0.0, 0.0, 2);
+        engine.add_clip(1, 0, 0, vec![0.5f32; 44100 * 2], 0.0, 0.0, 0.0, 2, false);
         engine.set_clip_loop(0, 0, 0.0, 0.5, true);
         let clip = &engine.clips[0];
         assert!(clip.has_valid_clip_loop());
@@ -987,7 +1043,7 @@ mod tests {
         engine.add_clip(
             1, 0, 0,
             vec![0.5f32; (nine_bars as usize) * 2],
-            0.0, 0.0, 0.0, 2,
+            0.0, 0.0, 0.0, 2, false,
         );
         assert!(!engine.clips[0].has_valid_clip_loop());
         engine.set_global_loop(0, fifteen_bars, true);
@@ -1027,7 +1083,7 @@ mod tests {
         engine.add_clip(
             1, 0, 0,
             vec![0.5f32; (nine_bars as usize) * 2],
-            0.0, 0.0, 0.0, 2,
+            0.0, 0.0, 0.0, 2, false,
         );
         engine.set_global_loop(0, bar_frames * 4, true);
         engine.trigger_clip(0, 0);
@@ -1061,7 +1117,7 @@ mod tests {
         engine.add_clip(
             1, 0, 0,
             vec![0.5f32; (nine_bars as usize) * 2],
-            0.0, 0.0, 0.0, 2,
+            0.0, 0.0, 0.0, 2, false,
         );
         // Loop individual de 1 compás al inicio del clip.
         let sr = engine.sample_rate;
@@ -1101,7 +1157,7 @@ mod tests {
                 samples.push(v);
                 samples.push(v);
             }
-            engine.add_clip(1, 0, 0, samples, 0.0, 0.0, 0.0, 2);
+            engine.add_clip(1, 0, 0, samples, 0.0, 0.0, 0.0, 2, false);
             match flow {
                 // 0: trigger y después Play (pad y luego transporte).
                 0 => {
@@ -1152,7 +1208,7 @@ mod tests {
         let mut engine = test_engine();
         engine.set_mode(EngineMode::OpenLive);
         let n = 4096u64;
-        engine.add_clip(1, 0, 0, vec![0.5f32; (n * 2) as usize], 0.0, 0.0, 0.0, 2);
+        engine.add_clip(1, 0, 0, vec![0.5f32; (n * 2) as usize], 0.0, 0.0, 0.0, 2, false);
         engine.trigger_clip(0, 0);
         engine.play();
         // Renderizar EXACTAMENTE la longitud nativa.
@@ -1188,7 +1244,7 @@ mod tests {
             samples.push(v);
         }
         let duration_secs = n as f32 / engine.sample_rate;
-        engine.add_clip(1, 0, 0, samples, 0.0, duration_secs, 0.0, 2);
+        engine.add_clip(1, 0, 0, samples, 0.0, duration_secs, 0.0, 2, false);
         engine.transport.sample_count = 0;
         engine.play();
         let mut raw = vec![0.0f32; 512 * 2];
@@ -1223,7 +1279,7 @@ mod tests {
     fn voice_elapsed_frames_tracks_linear_voice_clock() {
         let mut engine = test_engine();
         engine.set_mode(EngineMode::OpenLive);
-        engine.add_clip(1, 0, 0, vec![0.5f32; 8192 * 2], 0.0, 0.0, 0.0, 2);
+        engine.add_clip(1, 0, 0, vec![0.5f32; 8192 * 2], 0.0, 0.0, 0.0, 2, false);
         // Sin voz: None (fallback al cursor global).
         assert_eq!(engine.voice_elapsed_frames(0, 0), None);
         assert_eq!(engine.voice_elapsed_frames(9, 9), None);

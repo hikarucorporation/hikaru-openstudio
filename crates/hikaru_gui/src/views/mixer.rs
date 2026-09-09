@@ -78,7 +78,7 @@ impl Track {
 
 // --- MAIN MIXER RENDER ---
 
-pub fn show(ui: &mut Ui, tracks: &mut Vec<Track>, selected_idx: &mut usize, current_mode: &mut AppMode, output_level: f32) {
+pub fn show(ui: &mut Ui, tracks: &mut Vec<Track>, selected_idx: &mut usize, current_mode: &mut AppMode, output_level: f32, track_peaks: &[f32; 16]) {
     let shift_pressed = ui.input(|i| i.modifiers.shift);
 
     let left_pressed = ui.input(|i| i.key_pressed(egui::Key::ArrowLeft));
@@ -220,11 +220,13 @@ pub fn show(ui: &mut Ui, tracks: &mut Vec<Track>, selected_idx: &mut usize, curr
                     ui.with_layout(egui::Layout::left_to_right(egui::Align::Min), |ui| {
                         for i in 1..tracks.len() {
                             if let Some(track) = tracks.get_mut(i) {
-                                // Canales no-master: sin medición por pista aún,
-                                // el vúmetro sigue al fader atenuado por el
-                                // nivel real del master (si el master está en
-                                // silencio, todo está en silencio).
-                                let ch_level = (track.volume * output_level).clamp(0.0, 1.0);
+                                // VU meter por pista: peak Aislado de esa pista
+                                // (el engine calcula el peak ANTES del master fader).
+                                let ch_level = if let Some(mx_idx) = track.matrix_idx {
+                                    track_peaks.get(mx_idx).copied().unwrap_or(0.0)
+                                } else {
+                                    0.0
+                                };
                                 render_channel_strip(ui, track, fader_height, &tracks_map, i == *selected_idx, selected_idx, i, nav_event, ch_level);
                                 ui.add_space(4.0);
                             }

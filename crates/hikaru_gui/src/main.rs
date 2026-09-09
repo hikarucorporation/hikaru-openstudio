@@ -108,6 +108,7 @@ fn main() -> Result<(), eframe::Error> {
                                 duration_secs,
                                 offset_secs,
                                 channels,
+                                true,
                             );
                         }
                     } else {
@@ -167,7 +168,8 @@ fn main() -> Result<(), eframe::Error> {
                     println!("[Hikaru Engine] Sincronizando {} clips de Playlist...", clips.len());
 
                     if let Ok(mut engine) = engine_for_commands.lock() {
-                        engine.clips.clear();
+                        // SOLO eliminar clips de playlist (NO clips de la matrix).
+                        engine.clips.retain(|c| c.is_matrix_clip);
                         let target_sr = engine.sample_rate;
 
                         for clip_data in clips.into_iter() {
@@ -204,6 +206,7 @@ fn main() -> Result<(), eframe::Error> {
                                     clip_data.duration_secs,
                                     clip_data.offset_secs,
                                     channels,
+                                    false,
                                 );
                             } else {
                                 eprintln!("[Hikaru Engine Error] No se pudo abrir: {}", clip_data.path);
