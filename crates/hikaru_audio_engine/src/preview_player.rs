@@ -167,6 +167,12 @@ impl PreviewPlayer {
         self.shared.clone()
     }
 
+    /// Returns true if a preview is currently playing.
+    /// Used to skip the Arc::clone in process() when no preview is active.
+    pub fn is_active(&self) -> bool {
+        self.shared.is_playing.load(Ordering::Relaxed)
+    }
+
     pub fn set_volume(&mut self, vol: f32) {
         self.volume = vol.clamp(0.0, 1.0);
         self.shared

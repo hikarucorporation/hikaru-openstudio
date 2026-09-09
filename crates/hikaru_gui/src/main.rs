@@ -33,6 +33,7 @@ fn main() -> Result<(), eframe::Error> {
 
     let engine_for_commands = engine_arc.clone();
     std::thread::spawn(move || {
+        set_thread_realtime();
         while let Ok(command) = rx.recv() {
             match command {
                 // Sincronización del modo GUI -> Motor
@@ -167,50 +168,58 @@ fn main() -> Result<(), eframe::Error> {
                 GuiCommand::SyncPlaylistClips { clips } => {
                     println!("[Hikaru Engine] Sincronizando {} clips de Playlist...", clips.len());
 
-                    if let Ok(mut engine) = engine_for_commands.lock() {
-                        // SOLO eliminar clips de playlist (NO clips de la matrix).
-                        engine.clips.retain(|c| c.is_matrix_clip);
-                        let target_sr = engine.sample_rate;
+                    // Paso 1: Decodificar y resamplear TODOS los clips FUERA del lock.
+                    // Esto evita que el audio thread quede bloqueado durante I/O de disco.
+                    let target_sr = if let Ok(engine) = engine_for_commands.try_lock() {
+                        engine.sample_rate
+                    } else {
+                        44100.0
+                    };
 
-                        for clip_data in clips.into_iter() {
-                            if let Ok(mut reader) = hound::WavReader::open(&clip_data.path) {
-                                let spec = reader.spec();
-                                let file_sr = spec.sample_rate as f32;
-                                let channels = spec.channels as usize;
+                    let mut decoded_clips: Vec<(usize, usize, usize, Vec<f32>, f32, f32, f32, usize)> = Vec::with_capacity(clips.len());
+                    for clip_data in clips.into_iter() {
+                        if let Ok(mut reader) = hound::WavReader::open(&clip_data.path) {
+                            let spec = reader.spec();
+                            let file_sr = spec.sample_rate as f32;
+                            let channels = spec.channels as usize;
 
-                                let raw_samples: Vec<f32> = match spec.sample_format {
-                                    hound::SampleFormat::Float => {
-                                        reader.samples::<f32>().filter_map(Result::ok).collect()
-                                    }
-                                    hound::SampleFormat::Int => {
-                                        let max_val = (1 << (spec.bits_per_sample - 1)) as f32;
-                                        reader.samples::<i32>()
-                                            .filter_map(Result::ok)
-                                            .map(|s| s as f32 / max_val)
-                                            .collect()
-                                    }
-                                };
+                            let raw_samples: Vec<f32> = match spec.sample_format {
+                                hound::SampleFormat::Float => reader.samples::<f32>().filter_map(Result::ok).collect(),
+                                hound::SampleFormat::Int => {
+                                    let max_val = (1 << (spec.bits_per_sample - 1)) as f32;
+                                    reader.samples::<i32>()
+                                        .filter_map(Result::ok)
+                                        .map(|s| s as f32 / max_val)
+                                        .collect()
+                                }
+                            };
 
-                                let final_samples = if (file_sr - target_sr).abs() > 1.0 {
-                                    resample_linear(&raw_samples, channels, file_sr, target_sr)
-                                } else {
-                                    raw_samples
-                                };
-
-                                engine.add_clip(
-                                    clip_data.clip_id,
-                                    clip_data.track_index, // slot real de la pista en el Playlist
-                                    0,                      // scene_index: Playlist es lineal, no usa escenas
-                                    final_samples,
-                                    clip_data.start_secs,
-                                    clip_data.duration_secs,
-                                    clip_data.offset_secs,
-                                    channels,
-                                    false,
-                                );
+                            let final_samples = if (file_sr - target_sr).abs() > 1.0 {
+                                resample_linear(&raw_samples, channels, file_sr, target_sr)
                             } else {
-                                eprintln!("[Hikaru Engine Error] No se pudo abrir: {}", clip_data.path);
-                            }
+                                raw_samples
+                            };
+
+                            decoded_clips.push((
+                                clip_data.clip_id,
+                                clip_data.track_index,
+                                0, // scene_index: Playlist es lineal
+                                final_samples,
+                                clip_data.start_secs,
+                                clip_data.duration_secs,
+                                clip_data.offset_secs,
+                                channels,
+                            ));
+                        } else {
+                            eprintln!("[Hikaru Engine Error] No se pudo abrir: {}", clip_data.path);
+                        }
+                    }
+
+                    // Paso 2: Agregar clips al engine (solo la mutación, sin I/O).
+                    if let Ok(mut engine) = engine_for_commands.lock() {
+                        engine.clips.retain(|c| c.is_matrix_clip);
+                        for (clip_id, track_index, scene_index, samples, start, duration, offset, channels) in decoded_clips {
+                            engine.add_clip(clip_id, track_index, scene_index, samples, start, duration, offset, channels, false);
                         }
                     }
                 }
@@ -240,23 +249,23 @@ fn main() -> Result<(), eframe::Error> {
                     }
                 }
                 GuiCommand::SetTrackVolume { track_idx, volume_db } => {
-                    if let Ok(mut engine) = engine_for_commands.lock() {
-                        // volume_db is actually a linear 0.0..1.0 value from the GUI fader
+                    // Lock-free: atomic store, no mutex needed.
+                    if let Ok(engine) = engine_for_commands.try_lock() {
                         engine.set_track_volume(track_idx, volume_db);
                     }
                 }
                 GuiCommand::SetTrackPan { track_idx, pan } => {
-                    if let Ok(mut engine) = engine_for_commands.lock() {
+                    if let Ok(engine) = engine_for_commands.try_lock() {
                         engine.set_track_pan(track_idx, pan);
                     }
                 }
                 GuiCommand::SetTrackMute { track_idx, mute } => {
-                    if let Ok(mut engine) = engine_for_commands.lock() {
+                    if let Ok(engine) = engine_for_commands.try_lock() {
                         engine.set_track_mute(track_idx, mute);
                     }
                 }
                 GuiCommand::SetTrackSolo { track_idx, solo } => {
-                    if let Ok(mut engine) = engine_for_commands.lock() {
+                    if let Ok(engine) = engine_for_commands.try_lock() {
                         engine.set_track_solo(track_idx, solo);
                     }
                 }
@@ -445,6 +454,29 @@ fn decode_wav(path: &str) -> Result<WavData, Box<dyn std::error::Error>> {
 
 /// Resampling lineal channel-aware. Procesa frame-by-frame para que la
 /// interpolación nunca cruce canales (L↔R), preservando la imagen estéreo.
+/// Set the current thread to SCHED_FIFO realtime priority on Linux.
+/// Priority 50 is a safe middle ground (range 1-99).
+/// Falls back silently on non-Linux or if permissions are insufficient.
+#[cfg(target_os = "linux")]
+fn set_thread_realtime() {
+    unsafe {
+        let param = libc::sched_param {
+            sched_priority: 50,
+        };
+        let ret = libc::sched_setscheduler(0, libc::SCHED_FIFO, &param as *const libc::sched_param);
+        if ret == 0 {
+            println!("[Hikaru] Thread configurado en SCHED_FIFO prio=50");
+        } else {
+            eprintln!("[Hikaru] No se pudo setear SCHED_FIFO (¿permisos?). Usando SCHED_NORMAL.");
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn set_thread_realtime() {
+    // No-op en plataformas no-Linux (macOS/Windows usan APIs diferentes).
+}
+
 fn resample_linear(samples: &[f32], channels: usize, from_sr: f32, to_sr: f32) -> Vec<f32> {
     if samples.is_empty() || channels == 0 {
         return Vec::new();

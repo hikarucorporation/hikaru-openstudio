@@ -5,7 +5,7 @@
 
 pub mod preview_player;
 
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use hikaru_core::{AudioBuffer, SampleRate};
@@ -61,6 +61,13 @@ pub struct AudioClipInstance {
     /// Clip cargado desde la Session Matrix (OpenLive).
     /// `SyncPlaylistClips` NO debe eliminar estos clips al sincronizar.
     pub is_matrix_clip: bool,
+    /// Frame anterior renderizado (para detectar loop wrap y aplicar crossfade).
+    /// Se inicializa en `usize::MAX` (sin frame previo válido).
+    pub prev_frame: usize,
+    /// Crossfade restante en samples (0 = sin crossfade activo).
+    pub xfade_remaining: u32,
+    /// Longitud del crossfade configurada (para calcular la ganancia).
+    pub xfade_len: u32,
 }
 
 impl AudioClipInstance {
@@ -284,13 +291,14 @@ pub struct AudioEngine<'a> {
     track_output_bufs: Vec<Vec<f32>>,
     /// Per-track volume (0.0..1.0), indexado por track_index.
     /// 16 pistas máximas (TrackMatrix limit).
-    pub track_volumes: [f32; 16],
+    /// AtomicU32 para reads lock-free desde el audio thread.
+    pub track_volumes: [AtomicU32; 16],
     /// Per-track pan (-100.0..100.0), indexado por track_index.
-    pub track_pans: [f32; 16],
+    pub track_pans: [AtomicU32; 16],
     /// Per-track mute flag, indexado por track_index.
-    pub track_mutes: [bool; 16],
+    pub track_mutes: [AtomicBool; 16],
     /// Per-track solo flag, indexado por track_index.
-    pub track_solos: [bool; 16],
+    pub track_solos: [AtomicBool; 16],
 }
 
 impl<'a> AudioEngine<'a> {
@@ -312,10 +320,10 @@ impl<'a> AudioEngine<'a> {
             output_level_bits: Arc::new(AtomicU32::new(0.0f32.to_bits())),
             track_peak_bits: std::array::from_fn(|_| Arc::new(AtomicU32::new(0.0f32.to_bits()))),
             track_output_bufs: (0..16).map(|_| Vec::with_capacity(MAX_TRACK_BUF)).collect(),
-            track_volumes: [0.75; 16],
-            track_pans: [0.0; 16],
-            track_mutes: [false; 16],
-            track_solos: [false; 16],
+            track_volumes: std::array::from_fn(|_| AtomicU32::new(0.75f32.to_bits())),
+            track_pans: std::array::from_fn(|_| AtomicU32::new(0.0f32.to_bits())),
+            track_mutes: std::array::from_fn(|_| AtomicBool::new(false)),
+            track_solos: std::array::from_fn(|_| AtomicBool::new(false)),
         }
     }
 
@@ -353,27 +361,27 @@ impl<'a> AudioEngine<'a> {
         self.main_filter.set_params(2000.0, 0.707, new_sr);
     }
 
-    pub fn set_track_volume(&mut self, track_idx: usize, volume: f32) {
+    pub fn set_track_volume(&self, track_idx: usize, volume: f32) {
         if track_idx < 16 {
-            self.track_volumes[track_idx] = volume.clamp(0.0, 1.0);
+            self.track_volumes[track_idx].store(volume.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
         }
     }
 
-    pub fn set_track_pan(&mut self, track_idx: usize, pan: f32) {
+    pub fn set_track_pan(&self, track_idx: usize, pan: f32) {
         if track_idx < 16 {
-            self.track_pans[track_idx] = pan.clamp(-100.0, 100.0);
+            self.track_pans[track_idx].store(pan.clamp(-100.0, 100.0).to_bits(), Ordering::Relaxed);
         }
     }
 
-    pub fn set_track_mute(&mut self, track_idx: usize, mute: bool) {
+    pub fn set_track_mute(&self, track_idx: usize, mute: bool) {
         if track_idx < 16 {
-            self.track_mutes[track_idx] = mute;
+            self.track_mutes[track_idx].store(mute, Ordering::Relaxed);
         }
     }
 
-    pub fn set_track_solo(&mut self, track_idx: usize, solo: bool) {
+    pub fn set_track_solo(&self, track_idx: usize, solo: bool) {
         if track_idx < 16 {
-            self.track_solos[track_idx] = solo;
+            self.track_solos[track_idx].store(solo, Ordering::Relaxed);
         }
     }
 
@@ -499,6 +507,9 @@ impl<'a> AudioEngine<'a> {
             clip_loop_start: 0,
             clip_loop_end: 0,
             is_matrix_clip,
+            prev_frame: usize::MAX,
+            xfade_remaining: 0,
+            xfade_len: 0,
         };
 
         let is_studio = self.mode == EngineMode::OpenStudio;
@@ -678,9 +689,11 @@ impl<'a> AudioEngine<'a> {
         // El buffer del bloque actual se rellena con ceros.
         samples.fill(0.0);
 
-        // ── PREVIEW: SIEMPRE se mezcla si está activo ──
-        let preview = self.preview_player.shared_buffer();
-        preview.process(samples);
+        // ── PREVIEW: solo si hay preview activo (evita Arc::clone innecesario) ──
+        if self.preview_player.is_active() {
+            let preview = self.preview_player.shared_buffer();
+            preview.process(samples);
+        }
 
         // ── CLIP MIXING con per-track peaks ──
         if self.transport.playback_state == TransportPlaybackState::Playing {
@@ -700,13 +713,14 @@ impl<'a> AudioEngine<'a> {
             let mode = self.mode;
 
             // Pre-compute per-track gain (volume + pan + mute/solo).
-            let any_solo = self.track_solos.iter().any(|&s| s);
+            // Lecturas atómicas lock-free: el audio thread lee sin mutex.
+            let any_solo = self.track_solos.iter().any(|s| s.load(Ordering::Relaxed));
             let mut track_gain_l = [0.0f32; 16];
             let mut track_gain_r = [0.0f32; 16];
             for t in 0..16 {
-                let vol = self.track_volumes[t];
-                let muted = self.track_mutes[t];
-                let soloed = self.track_solos[t];
+                let vol = f32::from_bits(self.track_volumes[t].load(Ordering::Relaxed));
+                let muted = self.track_mutes[t].load(Ordering::Relaxed);
+                let soloed = self.track_solos[t].load(Ordering::Relaxed);
                 let effective_gain = if muted {
                     0.0
                 } else if any_solo && !soloed {
@@ -714,7 +728,7 @@ impl<'a> AudioEngine<'a> {
                 } else {
                     vol
                 };
-                let pan_norm = self.track_pans[t] / 100.0;
+                let pan_norm = f32::from_bits(self.track_pans[t].load(Ordering::Relaxed)) / 100.0;
                 track_gain_l[t] = effective_gain * if pan_norm > 0.0 {
                     1.0 - pan_norm
                 } else {
@@ -727,10 +741,7 @@ impl<'a> AudioEngine<'a> {
                 };
             }
 
-            // ── FASE 1: Resize + zero ──
-            // `resize` solo re-counts len cuando `buf_len` no cambió (no-op).
-            // `fill(0.0)` SIEMPRE limpia: necesario porque `resize` con la
-            // misma longitud NO pone a cero el contenido (Rust no lo garantiza).
+            // ── FASE 1: Zero la región usada de cada scratch buffer ──
             for buf in self.track_output_bufs.iter_mut() {
                 if buf.len() != buf_len {
                     buf.resize(buf_len, 0.0);
@@ -756,15 +767,8 @@ impl<'a> AudioEngine<'a> {
                         let relative_frame = (global_frame - clip.start_frame) as usize;
                         let src_frame = offset_frames.saturating_add(relative_frame);
                         let l = clip.read_sample(src_frame) * gl;
-                        if l == 0.0 {
-                            let r = clip.read_sample_r(src_frame) * gr;
-                            if r == 0.0 {
-                                continue;
-                            }
-                            track_buf[f * 2 + 1] += r;
-                            continue;
-                        }
                         let r = clip.read_sample_r(src_frame) * gr;
+                        // Acumular siempre: add 0.0 es gratis y evita branch miss.
                         track_buf[f * 2] += l;
                         track_buf[f * 2 + 1] += r;
                     }
@@ -775,6 +779,7 @@ impl<'a> AudioEngine<'a> {
 
                     let offset_frames = clip.sample_offset / clip.channels.max(1);
                     let emission = clip.emission_len_frames();
+                    let xfade_frames: usize = if clip.has_valid_clip_loop() { 32 } else { 0 };
                     let mut clip_finished = false;
                     for f in 0..buffer_frames as usize {
                         let abs = abs_start + f as u64;
@@ -792,13 +797,50 @@ impl<'a> AudioEngine<'a> {
                         };
 
                         let src_frame = offset_frames.saturating_add(relative_frame);
-                        let l = clip.read_sample(src_frame) * gl;
-                        let r = clip.read_sample_r(src_frame) * gr;
-                        if l == 0.0 && r == 0.0 {
-                            continue;
+
+                        // ── MICRO-CROSSFADE en loop boundary ──
+                        // Detectar wrap: frame actual < frame anterior
+                        // (el módulo saltó de ~loop_end a ~loop_start).
+                        if xfade_frames > 0
+                            && clip.prev_frame != usize::MAX
+                            && relative_frame < clip.prev_frame
+                            && clip.prev_frame - relative_frame > (emission / 2) as usize
+                        {
+                            // Iniciar crossfade de32 samples.
+                            clip.xfade_remaining = xfade_frames as u32;
+                            clip.xfade_len = xfade_frames as u32;
                         }
-                        track_buf[f * 2] += l;
-                        track_buf[f * 2 + 1] += r;
+
+                        if clip.xfade_remaining > 0 {
+                            // Crossfade: mezclar muestra actual con la
+                            // muestra del frame anterior (fin del loop).
+                            let fade_pos = clip.xfade_len - clip.xfade_remaining;
+                            let fade_total = clip.xfade_len as f32;
+                            let out_gain = fade_pos as f32 / fade_total;   // 0→1
+                            let in_gain = 1.0 - out_gain;                  // 1→0
+
+                            // Muestra "nueva" (inicio del loop).
+                            let l_new = clip.read_sample(src_frame) * gl;
+                            let r_new = clip.read_sample_r(src_frame) * gr;
+
+                            // Muestra "vieja" (fin del loop anterior).
+                            let prev_src = offset_frames.saturating_add(clip.prev_frame);
+                            let l_old = clip.read_sample(prev_src) * gl;
+                            let r_old = clip.read_sample_r(prev_src) * gr;
+
+                            track_buf[f * 2] += l_old * in_gain + l_new * out_gain;
+                            track_buf[f * 2 + 1] += r_old * in_gain + r_new * out_gain;
+
+                            clip.xfade_remaining -= 1;
+                        } else {
+                            // Lectura normal sin crossfade.
+                            let l = clip.read_sample(src_frame) * gl;
+                            let r = clip.read_sample_r(src_frame) * gr;
+                            track_buf[f * 2] += l;
+                            track_buf[f * 2 + 1] += r;
+                        }
+
+                        clip.prev_frame = relative_frame;
                     }
                     if clip_finished {
                         clip.is_playing = false;
@@ -806,26 +848,23 @@ impl<'a> AudioEngine<'a> {
                 }
             }
 
-            // ── FASE 3: Peak + Mix en UN solo pass por track ──
-            // Antes: 2 loops separados (peak scan + mix) = 2 × buf_len.
-            // Ahora: 1 solo loop que calcula peak Y mezcla simultáneamente.
+            // ── FASE 3: Mix directo al output + peak branchless ──
+            // Sin `if v != 0.0`: add 0.0 es identidad, zero branch mispredict.
+            // Peak branchless: `abs(x) = x.abs()` + `max(a,b) = if a>b{a}else{b}`
+            // sin conditional sobre datos de audio (branchless por CPU pipeline).
             for t in 0..16 {
                 let track_buf = &self.track_output_bufs[t];
 
                 let mut track_peak = 0.0f32;
                 for i in 0..buf_len {
                     let v = track_buf[i];
-                    // Peak (abs, skip non-finite).
-                    if v.is_finite() {
-                        let a = v.abs();
-                        if a > track_peak {
-                            track_peak = a;
-                        }
+                    // Branchless peak: NaN/Inf → 0.0, finito → abs.
+                    let a = if v.is_finite() { v.abs() } else { 0.0 };
+                    if a > track_peak {
+                        track_peak = a;
                     }
-                    // Mix → output.
-                    if v != 0.0 {
-                        samples[i] += v;
-                    }
+                    // Mix directo: siempre sumo, sin chequeo.
+                    samples[i] += v;
                 }
 
                 self.track_peak_bits[t].store(track_peak.to_bits(), Ordering::Relaxed);
@@ -841,13 +880,16 @@ impl<'a> AudioEngine<'a> {
         }
 
         // Pico real del bloque (preview + clips mix) para el vúmetro master.
+        // Soft-clipper: tanh() satura suavemente sin hard-clip artifacts.
+        // Mantiene la forma de onda y previene clipping de la placa.
         let mut peak = 0.0f32;
-        for &s in samples.iter() {
-            if s.is_finite() {
-                let a = s.abs();
-                if a > peak {
-                    peak = a;
-                }
+        for s in samples.iter_mut() {
+            // Soft-clip: tanh() mapea (-∞,+∞) → (-1,+1) con curva suave.
+            *s = s.tanh();
+            // Branchless peak.
+            let a = (*s).abs();
+            if a > peak {
+                peak = a;
             }
         }
         self.output_level_bits.store(peak.to_bits(), Ordering::Relaxed);
@@ -864,10 +906,10 @@ mod tests {
 
     fn test_engine() -> AudioEngine<'static> {
         let clock = Arc::new(AtomicU64::new(0));
-        let mut engine = AudioEngine::new(SampleRate::new(44100.0), &TABLE, clock);
+        let engine = AudioEngine::new(SampleRate::new(44100.0), &TABLE, clock);
         // Unity gain for all tracks in tests (bypass per-track volume)
         for t in 0..16 {
-            engine.track_volumes[t] = 1.0;
+            engine.track_volumes[t].store(1.0f32.to_bits(), Ordering::Relaxed);
         }
         engine
     }
@@ -1148,7 +1190,14 @@ mod tests {
             last_peak = raw.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
             remaining -= step;
         }
-        assert_eq!(last_peak, 0.5);
+        // Con tanh() soft-clipper, el peak se satura suavemente.
+        // tanh(0.5) ≈ 0.4621.
+        let expected_peak = 0.5f32.tanh();
+        assert!(
+            (last_peak - expected_peak).abs() < 1e-4,
+            "peak {} debe ser ≈ tanh(0.5) = {}",
+            last_peak, expected_peak
+        );
         assert!(engine.clips[0].is_playing);
     }
 
@@ -1197,13 +1246,16 @@ mod tests {
             engine.process(&mut buf);
             for f in 0..512usize {
                 let expect = f as f32 / n as f32;
+                // Tolerancia ampliada para tanh() soft-clipper en la salida master.
+                // tanh(x) ≈ x - x³/3 para valores pequeños; la máxima distorsión
+                // en el rango de este test (0..0.125) es ~6.5e-4.
                 assert!(
-                    (raw[f * 2] - expect).abs() < 1e-6,
+                    (raw[f * 2] - expect).abs() < 2e-3,
                     "flow {}: frame L{} = {} (esperado {})",
                     flow, f, raw[f * 2], expect
                 );
                 assert!(
-                    (raw[f * 2 + 1] - expect).abs() < 1e-6,
+                    (raw[f * 2 + 1] - expect).abs() < 2e-3,
                     "flow {}: frame R{} = {} (esperado {})",
                     flow, f, raw[f * 2 + 1], expect
                 );
@@ -1263,8 +1315,9 @@ mod tests {
         engine.process(&mut buf);
         for f in 0..512usize {
             let expect = f as f32 / n as f32;
+            // Tolerancia ampliada para tanh() soft-clipper.
             assert!(
-                (raw[f * 2] - expect).abs() < 1e-6,
+                (raw[f * 2] - expect).abs() < 2e-3,
                 "frame L{} = {} (esperado {})",
                 f, raw[f * 2], expect
             );
