@@ -197,6 +197,10 @@ pub struct HikaruApp {
     /// Peaks por pista: clones de los `Arc<AtomicU32>` del engine.
     /// El mixer lee estos valores para los VU meters individuales.
     pub track_peak_bits: Vec<Arc<AtomicU32>>,
+    /// Smoothed peaks (GUI-side lerp) para VU meters sin flicker.
+    /// Fórmula: `smoothed = smoothed * 0.85 + raw * 0.15` por frame.
+    pub smoothed_track_peaks: [f32; 16],
+    pub smoothed_master_peak: f32,
 }
 
 impl HikaruApp {
@@ -284,6 +288,8 @@ impl HikaruApp {
             _audio_stream: audio_stream,
             engine_handle,
             track_peak_bits: track_peak_bits_init,
+            smoothed_track_peaks: [0.0; 16],
+            smoothed_master_peak: 0.0,
         }
     }
 
@@ -588,15 +594,21 @@ impl eframe::App for HikaruApp {
 
         if self.show_mixer {
             // Nivel real del engine: 0.0 en silencio == -inf dB.
-            let output_level =
+            let raw_master =
                 f32::from_bits(self.output_level_bits.load(Ordering::Relaxed));
-            let output_level = if output_level.is_finite() { output_level } else { 0.0 };
+            let raw_master = if raw_master.is_finite() { raw_master } else { 0.0 };
+            // GUI-side lerp: suavizar para VU meter sin flicker.
+            self.smoothed_master_peak = self.smoothed_master_peak * 0.85 + raw_master * 0.15;
+            let output_level = self.smoothed_master_peak;
 
             // Leer peaks por pista desde los Arc<AtomicU32> del engine.
             let mut track_peaks = [0.0f32; 16];
             for (i, arc) in self.track_peak_bits.iter().enumerate().take(16) {
-                let val = f32::from_bits(arc.load(Ordering::Relaxed));
-                track_peaks[i] = if val.is_finite() { val } else { 0.0 };
+                let raw = f32::from_bits(arc.load(Ordering::Relaxed));
+                let raw = if raw.is_finite() { raw } else { 0.0 };
+                // GUI-side lerp por pista.
+                self.smoothed_track_peaks[i] = self.smoothed_track_peaks[i] * 0.85 + raw * 0.15;
+                track_peaks[i] = self.smoothed_track_peaks[i];
             }
 
             // SYNC PRE-MIXER: capturar estado viejo de la matrix

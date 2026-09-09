@@ -14,6 +14,11 @@ use hikaru_dsp::synth::wavetable::WavetableOscillator;
 use hikaru_sequencer::TrackMatrix;
 use hikaru_transport::{TransportPlaybackState, TransportPosition};
 
+/// Máximo de frames stereo por bloque de audio. 2048 frames × 2 canales =
+/// 8192 floats, cubre 48kHz @ ~42ms (BlockSize estándar de CPAL).
+/// Pre-asignado una vez, cero heap alloc en el audio thread.
+const MAX_TRACK_BUF: usize = 2048 * 2;
+
 use crate::preview_player::PreviewPlayer;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -273,6 +278,9 @@ pub struct AudioEngine<'a> {
     pub track_peak_bits: [Arc<AtomicU32>; 16],
     /// Buffers scratch por pista para acumular señal aislada antes de la
     /// mezcla final. Cada buffer es stereo (frames * 2).
+    /// Se pre-asigna UNA VEZ con capacidad fija en `new()`. El `resize`
+    /// en `process()` es no-op cuando `buffer_frames` no cambia (producción
+    /// CPAL usa block size fijo → cero heap alloc en el audio thread).
     track_output_bufs: Vec<Vec<f32>>,
     /// Per-track volume (0.0..1.0), indexado por track_index.
     /// 16 pistas máximas (TrackMatrix limit).
@@ -303,7 +311,7 @@ impl<'a> AudioEngine<'a> {
             absolute_frame: 0,
             output_level_bits: Arc::new(AtomicU32::new(0.0f32.to_bits())),
             track_peak_bits: std::array::from_fn(|_| Arc::new(AtomicU32::new(0.0f32.to_bits()))),
-            track_output_bufs: vec![Vec::new(); 16],
+            track_output_bufs: (0..16).map(|_| Vec::with_capacity(MAX_TRACK_BUF)).collect(),
             track_volumes: [0.75; 16],
             track_pans: [0.0; 16],
             track_mutes: [false; 16],
@@ -719,7 +727,10 @@ impl<'a> AudioEngine<'a> {
                 };
             }
 
-            // Asegurar que los scratch buffers tengan el tamaño correcto.
+            // ── FASE 1: Resize + zero ──
+            // `resize` solo re-counts len cuando `buf_len` no cambió (no-op).
+            // `fill(0.0)` SIEMPRE limpia: necesario porque `resize` con la
+            // misma longitud NO pone a cero el contenido (Rust no lo garantiza).
             for buf in self.track_output_bufs.iter_mut() {
                 if buf.len() != buf_len {
                     buf.resize(buf_len, 0.0);
@@ -727,7 +738,7 @@ impl<'a> AudioEngine<'a> {
                 buf.fill(0.0);
             }
 
-            // Acumular clips en scratch buffers por pista.
+            // ── FASE 2: Acumular clips en scratch buffers por pista ──
             for clip in self.clips.iter_mut() {
                 let ti = clip.track_index.min(15);
                 let gl = track_gain_l[ti];
@@ -795,29 +806,29 @@ impl<'a> AudioEngine<'a> {
                 }
             }
 
-            // Calcular peaks por pista y mezclar en output.
+            // ── FASE 3: Peak + Mix en UN solo pass por track ──
+            // Antes: 2 loops separados (peak scan + mix) = 2 × buf_len.
+            // Ahora: 1 solo loop que calcula peak Y mezcla simultáneamente.
             for t in 0..16 {
                 let track_buf = &self.track_output_bufs[t];
 
-                // Peak de esta pista (pre-master).
                 let mut track_peak = 0.0f32;
-                for &s in track_buf.iter() {
-                    if s.is_finite() {
-                        let a = s.abs();
+                for i in 0..buf_len {
+                    let v = track_buf[i];
+                    // Peak (abs, skip non-finite).
+                    if v.is_finite() {
+                        let a = v.abs();
                         if a > track_peak {
                             track_peak = a;
                         }
                     }
-                }
-                self.track_peak_bits[t].store(track_peak.to_bits(), Ordering::Relaxed);
-
-                // Mezclar scratch buffer → output.
-                for i in 0..buf_len {
-                    let v = track_buf[i];
+                    // Mix → output.
                     if v != 0.0 {
                         samples[i] += v;
                     }
                 }
+
+                self.track_peak_bits[t].store(track_peak.to_bits(), Ordering::Relaxed);
             }
 
             self.transport.sample_count = self.transport.wrap_sample_count(frame_end);
