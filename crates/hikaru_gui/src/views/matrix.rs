@@ -336,7 +336,7 @@ pub fn show(
                                                 };
                                                 if ui.toggle_value(&mut state.tracks[track_idx].soloed, solo_btn_text).clicked() {
                                                     audio_proxy.send(GuiCommand::SetTrackSolo {
-                                                        track_idx,
+                                                        track_idx: track_idx + 1,
                                                         solo: state.tracks[track_idx].soloed,
                                                     });
                                                 }
@@ -348,7 +348,7 @@ pub fn show(
                                                 };
                                                 if ui.toggle_value(&mut state.tracks[track_idx].muted, mute_btn_text).clicked() {
                                                     audio_proxy.send(GuiCommand::SetTrackMute {
-                                                        track_idx,
+                                                        track_idx: track_idx + 1,
                                                         mute: state.tracks[track_idx].muted,
                                                     });
                                                 }

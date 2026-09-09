@@ -60,6 +60,7 @@ pub struct Track {
     pub route_destination_id: usize, 
     pub sends: Vec<SendConnection>,
     pub effects: Vec<DspSlot>,
+    pub matrix_idx: Option<usize>,
 }
 
 impl Track {
@@ -70,6 +71,7 @@ impl Track {
             route_destination_id: 0,
             sends: Vec::new(),
             effects: Vec::new(),
+            matrix_idx: None,
         }
     }
 }
@@ -256,11 +258,11 @@ fn render_channel_strip(
                 ui.set_width(85.0);
                 ui.vertical_centered(|ui| {
                     
-                    // --- CABECERA DE CANAL LIMPIA (TRK XX) ---
+                    // --- CABECERA DE CANAL LIMPIA (TRK XX: Name) ---
                     let strip_label = if track.is_master {
                         "MASTER".to_string()
                     } else {
-                        format!("TRK {:02}", track.id)
+                        format!("TRK {:02}: {}", track.id, track.name)
                     };
 
                     let is_this_selected = current_idx == *selected_idx;

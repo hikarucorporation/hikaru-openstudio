@@ -18,6 +18,129 @@ use crate::views::{
     about, audio_settings, dsp_rack, explorer, footer, header, matrix, menu_bar, mixer, open_wavetable, playlist,
 };
 
+/// Sincronización bidireccional Matrix ↔ Mixer.
+/// Detecta qué lado cambió (comparando con old_matrix / old_mixer)
+/// y propicia los cambios al otro lado + al engine.
+fn sync_matrix_mixer_bidirectional(
+    live_tracks: &mut Vec<mixer::Track>,
+    matrix_state: &mut matrix::SessionMatrixState,
+    old_matrix: &[matrix::TrackMeta],
+    old_mixer: &[(f32, f32, bool, bool)],
+    audio_proxy: &AudioProxy,
+) {
+    // 1. Asegurar que MASTER existe en idx 0
+    if live_tracks.is_empty() || !live_tracks[0].is_master {
+        live_tracks.insert(0, mixer::Track::new(0, "MASTER".to_string(), true));
+    }
+    live_tracks[0].matrix_idx = None;
+
+    // 2. Sincronizar cantidad de tracks
+    let matrix_len = matrix_state.tracks.len();
+
+    // Mixer tiene más tracks que matrix → quitar exceso
+    while live_tracks.len() > matrix_len + 1 {
+        live_tracks.pop();
+    }
+    // Matrix tiene más tracks que mixer → agregar
+    while live_tracks.len() < matrix_len + 1 {
+        let idx = live_tracks.len() - 1;
+        let mx = &matrix_state.tracks[idx];
+        let mut t = mixer::Track::new(idx + 1, mx.name.clone(), false);
+        t.volume = mx.volume;
+        t.pan = mx.pan;
+        t.mute = mx.muted;
+        t.solo = mx.soloed;
+        t.matrix_idx = Some(idx);
+        live_tracks.push(t);
+    }
+
+    // 3. Sincronizar parámetros por track (matrix ↔ mixer → engine)
+    for i in 0..matrix_len {
+        let mixer_idx = i + 1;
+        if mixer_idx >= live_tracks.len() { break; }
+
+        // Leer valores de la matrix en variables locales (evita borrow overlap)
+        let (mx_name, mx_vol, mx_pan, mx_muted, mx_soloed) = {
+            let mx = &matrix_state.tracks[i];
+            (mx.name.clone(), mx.volume, mx.pan, mx.muted, mx.soloed)
+        };
+        let old_mx = old_matrix.get(i);
+        let old_mx_vol = old_mx.map(|m| m.volume).unwrap_or(0.75);
+        let old_mx_pan = old_mx.map(|m| m.pan).unwrap_or(0.0);
+        let old_mx_mute = old_mx.map(|m| m.muted).unwrap_or(false);
+        let old_mx_solo = old_mx.map(|m| m.soloed).unwrap_or(false);
+        let old_mix = old_mixer.get(mixer_idx);
+        let old_mix_vol = old_mix.map(|m| m.0).unwrap_or(0.75);
+        let old_mix_pan = old_mix.map(|m| m.1).unwrap_or(0.0);
+        let old_mix_mute = old_mix.map(|m| m.2).unwrap_or(false);
+        let old_mix_solo = old_mix.map(|m| m.3).unwrap_or(false);
+
+        let t = &mut live_tracks[mixer_idx];
+        t.name = mx_name;
+        t.matrix_idx = Some(i);
+
+        // VOLUMEN: matrix cambió → mixer; mixer cambió → matrix + engine
+        let matrix_changed = (mx_vol - old_mx_vol).abs() > f32::EPSILON;
+        let mixer_changed = (t.volume - old_mix_vol).abs() > f32::EPSILON;
+        if matrix_changed && !mixer_changed {
+            t.volume = mx_vol;
+        } else if mixer_changed {
+            matrix_state.tracks[i].volume = t.volume;
+            audio_proxy.send(GuiCommand::SetTrackVolume {
+                track_idx: mixer_idx,
+                volume_db: t.volume,
+            });
+        }
+
+        // PAN: matrix cambió → mixer; mixer cambió → matrix + engine
+        let matrix_changed = (mx_pan - old_mx_pan).abs() > f32::EPSILON;
+        let mixer_changed = (t.pan - old_mix_pan).abs() > f32::EPSILON;
+        if matrix_changed && !mixer_changed {
+            t.pan = mx_pan;
+        } else if mixer_changed {
+            matrix_state.tracks[i].pan = t.pan;
+            audio_proxy.send(GuiCommand::SetTrackPan {
+                track_idx: mixer_idx,
+                pan: t.pan,
+            });
+        }
+
+        // MUTE: matrix cambió → mixer + engine; mixer cambió → matrix + engine
+        let matrix_changed = mx_muted != old_mx_mute;
+        let mixer_changed = t.mute != old_mix_mute;
+        if matrix_changed && !mixer_changed {
+            t.mute = mx_muted;
+            audio_proxy.send(GuiCommand::SetTrackMute {
+                track_idx: mixer_idx,
+                mute: t.mute,
+            });
+        } else if mixer_changed {
+            matrix_state.tracks[i].muted = t.mute;
+            audio_proxy.send(GuiCommand::SetTrackMute {
+                track_idx: mixer_idx,
+                mute: t.mute,
+            });
+        }
+
+        // SOLO: matrix cambió → mixer + engine; mixer cambió → matrix + engine
+        let matrix_changed = mx_soloed != old_mx_solo;
+        let mixer_changed = t.solo != old_mix_solo;
+        if matrix_changed && !mixer_changed {
+            t.solo = mx_soloed;
+            audio_proxy.send(GuiCommand::SetTrackSolo {
+                track_idx: mixer_idx,
+                solo: t.solo,
+            });
+        } else if mixer_changed {
+            matrix_state.tracks[i].soloed = t.solo;
+            audio_proxy.send(GuiCommand::SetTrackSolo {
+                track_idx: mixer_idx,
+                solo: t.solo,
+            });
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppMode {
     OpenLive,
@@ -87,11 +210,18 @@ impl HikaruApp {
 
         let mut live_tracks = vec![
             mixer::Track::new(0, "MASTER".to_string(), true),
-            mixer::Track::new(1, "BASS 01".to_string(), false),
-            mixer::Track::new(2, "DRUMS".to_string(), false),
         ];
+        let mut matrix_state = matrix::SessionMatrixState::default();
+        // Sync inicial: crear tracks del mixer desde la matrix
+        {
+            let empty_old: Vec<matrix::TrackMeta> = Vec::new();
+            let empty_mixer_old: Vec<(f32, f32, bool, bool)> = Vec::new();
+            sync_matrix_mixer_bidirectional(
+                &mut live_tracks, &mut matrix_state, &empty_old, &empty_mixer_old, &audio_proxy,
+            );
+        }
         for t in &mut live_tracks {
-            t.volume = 0.70;
+            if t.volume <= 0.0 { t.volume = 0.70; }
         }
 
         let mut studio_tracks = vec![
@@ -122,7 +252,7 @@ impl HikaruApp {
             is_recording: false,
 
             playlist_state: playlist::PlaylistState::default(),
-            matrix_state: matrix::SessionMatrixState::default(),
+            matrix_state,
 
             live_tracks,
             studio_tracks,
@@ -446,6 +576,19 @@ impl eframe::App for HikaruApp {
             let output_level =
                 f32::from_bits(self.output_level_bits.load(Ordering::Relaxed));
             let output_level = if output_level.is_finite() { output_level } else { 0.0 };
+
+            // SYNC PRE-MIXER: capturar estado viejo de la matrix
+            let old_matrix: Vec<matrix::TrackMeta> = if self.mode == AppMode::OpenLive {
+                self.matrix_state.tracks.clone()
+            } else {
+                Vec::new()
+            };
+
+            // Capturar estado viejo del mixer ANTES del render
+            let old_live: Vec<(f32, f32, bool, bool)> = self.live_tracks.iter()
+                .map(|t| (t.volume, t.pan, t.mute, t.solo))
+                .collect();
+
             ctx.show_viewport_immediate(
                 ViewportId::from_hash_of("hikaru_mixer_viewport"),
                 ViewportBuilder::default()
@@ -462,6 +605,17 @@ impl eframe::App for HikaruApp {
                     });
                 },
             );
+
+            // SYNC POST-MIXER: sincronización bidireccional Matrix ↔ Mixer → Engine
+            if self.mode == AppMode::OpenLive {
+                sync_matrix_mixer_bidirectional(
+                    &mut self.live_tracks,
+                    &mut self.matrix_state,
+                    &old_matrix,
+                    &old_live,
+                    &self.audio_proxy,
+                );
+            }
         }
 
         if self.show_dsp_rack {
