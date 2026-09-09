@@ -4,7 +4,7 @@
 // crates/hikaru_gui/src/views/matrix.rs
 
 use egui::{
-    Align2, Button, Color32, CursorIcon, Grid, Frame, ScrollArea, Sense, Stroke, Ui, Vec2
+    Align2, Button, Color32, CursorIcon, Grid, Frame, RichText, ScrollArea, Sense, Stroke, Ui, Vec2
 };
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -73,6 +73,8 @@ pub struct TrackMeta {
     pub name: String,
     pub muted: bool,
     pub soloed: bool,
+    pub volume: f32,
+    pub pan: f32,
 }
 
 #[derive(Clone, Debug)]
@@ -100,6 +102,8 @@ impl Default for SessionMatrixState {
                 name: format!("Audio {}", i + 1),
                 muted: false,
                 soloed: false,
+                volume: 0.75,
+                pan: 0.0,
             })
             .collect();
 
@@ -130,6 +134,8 @@ impl SessionMatrixState {
             name: format!("Audio {}", track_num),
             muted: false,
             soloed: false,
+            volume: 0.75,
+            pan: 0.0,
         });
 
         let scene_count = self.scenes.len();
@@ -305,21 +311,80 @@ pub fn show(
                         ui.end_row();
 
                         for track_idx in 0..state.tracks.len() {
-                            ui.group(|ui| {
-                                ui.set_min_size(Vec2::new(130.0, 42.0));
-                                ui.horizontal(|ui| {
-                                    ui.label(&state.tracks[track_idx].name);
-                                    let mute_btn = if state.tracks[track_idx].muted { "M!" } else { "M" };
-                                    if ui.small_button(mute_btn).clicked() {
-                                        state.tracks[track_idx].muted = !state.tracks[track_idx].muted;
-                                    }
+                            Frame::none()
+                                .fill(Color32::from_rgb(28, 28, 32))
+                                .stroke(Stroke::new(1.0_f32, Color32::from_gray(45)))
+                                .inner_margin(4.0)
+                                .show(ui, |ui| {
+                                    ui.set_min_size(Vec2::new(126.0, 50.0));
+                                    ui.vertical(|ui| {
+                                        ui.horizontal(|ui| {
+                                            let text_width = 70.0_f32;
+                                            ui.add(
+                                                egui::TextEdit::singleline(&mut state.tracks[track_idx].name)
+                                                    .text_color(Color32::WHITE)
+                                                    .font(egui::FontId::proportional(11.0))
+                                                    .frame(false)
+                                                    .desired_width(text_width),
+                                            );
 
-                                    let solo_btn = if state.tracks[track_idx].soloed { "S!" } else { "S" };
-                                    if ui.small_button(solo_btn).clicked() {
-                                        state.tracks[track_idx].soloed = !state.tracks[track_idx].soloed;
-                                    }
+                                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                let solo_btn_text = if state.tracks[track_idx].soloed {
+                                                    RichText::new("S").strong().color(Color32::from_rgb(255, 200, 0))
+                                                } else {
+                                                    RichText::new("S").color(Color32::from_gray(160))
+                                                };
+                                                if ui.toggle_value(&mut state.tracks[track_idx].soloed, solo_btn_text).clicked() {
+                                                    audio_proxy.send(GuiCommand::SetTrackSolo {
+                                                        track_idx,
+                                                        solo: state.tracks[track_idx].soloed,
+                                                    });
+                                                }
+
+                                                let mute_btn_text = if state.tracks[track_idx].muted {
+                                                    RichText::new("M").strong().color(Color32::from_rgb(255, 80, 80))
+                                                } else {
+                                                    RichText::new("M").color(Color32::from_gray(160))
+                                                };
+                                                if ui.toggle_value(&mut state.tracks[track_idx].muted, mute_btn_text).clicked() {
+                                                    audio_proxy.send(GuiCommand::SetTrackMute {
+                                                        track_idx,
+                                                        mute: state.tracks[track_idx].muted,
+                                                    });
+                                                }
+                                            });
+                                        });
+
+                                        ui.add_space(2.0);
+
+                                        ui.horizontal(|ui| {
+                                            playlist::knob_ui(ui, &mut state.tracks[track_idx].pan, 6.0);
+
+                                            let pan_text = if state.tracks[track_idx].pan < -1.0 {
+                                                format!("L{:.0}", state.tracks[track_idx].pan.abs())
+                                            } else if state.tracks[track_idx].pan > 1.0 {
+                                                format!("R{:.0}", state.tracks[track_idx].pan)
+                                            } else {
+                                                "C".to_string()
+                                            };
+                                            ui.label(RichText::new(pan_text).size(9.0).color(Color32::from_rgb(0, 255, 255)));
+
+                                            ui.add_space(2.0);
+
+                                            let slider_width = 38.0_f32;
+                                            playlist::custom_h_slider(ui, &mut state.tracks[track_idx].volume, slider_width);
+
+                                            let db_val = if state.tracks[track_idx].volume <= 0.0 {
+                                                -60.0
+                                            } else if state.tracks[track_idx].volume <= 0.75 {
+                                                -60.0 + (state.tracks[track_idx].volume / 0.75) * 60.0
+                                            } else {
+                                                ((state.tracks[track_idx].volume - 0.75) / 0.25) * 6.0
+                                            };
+                                            ui.label(RichText::new(format!("{:.1}dB", db_val)).size(8.5).weak());
+                                        });
+                                    });
                                 });
-                            });
 
                             for scene_idx in 0..state.scenes.len() {
                                 render_pad(ui, state, dragged_sample, audio_proxy, track_idx, scene_idx, bpm);
@@ -414,7 +479,7 @@ fn render_pad(
         border_color = Color32::WHITE;
     }
 
-    let size = Vec2::new(110.0, 42.0);
+    let size = Vec2::new(110.0, 54.0);
     let (rect, response) = ui.allocate_exact_size(size, Sense::click());
 
     if ui.is_rect_visible(rect) {

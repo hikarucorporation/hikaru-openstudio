@@ -377,7 +377,7 @@ fn ticks_to_secs_precise(ticks: u64, ppqn: u64, bpm: f64) -> f32 {
     (ticks as f64 * seconds_per_tick) as f32
 }
 
-fn knob_ui(ui: &mut Ui, value: &mut f32, radius: f32) -> egui::Response {
+pub fn knob_ui(ui: &mut Ui, value: &mut f32, radius: f32) -> egui::Response {
     let desired_size = Vec2::splat(radius * 2.0);
     let (rect, response) = ui.allocate_at_least(desired_size, Sense::click_and_drag());
 
@@ -413,7 +413,7 @@ fn knob_ui(ui: &mut Ui, value: &mut f32, radius: f32) -> egui::Response {
     response
 }
 
-fn custom_h_slider(ui: &mut Ui, value: &mut f32, width: f32) -> egui::Response {
+pub fn custom_h_slider(ui: &mut Ui, value: &mut f32, width: f32) -> egui::Response {
     let height = 14.0;
     let desired_size = Vec2::new(width, height);
     let (rect, response) = ui.allocate_at_least(desired_size, Sense::click_and_drag());

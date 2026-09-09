@@ -236,6 +236,27 @@ fn main() -> Result<(), eframe::Error> {
                         engine.transport.set_bpm(bpm as f64);
                     }
                 }
+                GuiCommand::SetTrackVolume { track_idx, volume_db } => {
+                    if let Ok(mut engine) = engine_for_commands.lock() {
+                        // volume_db is actually a linear 0.0..1.0 value from the GUI fader
+                        engine.set_track_volume(track_idx, volume_db);
+                    }
+                }
+                GuiCommand::SetTrackPan { track_idx, pan } => {
+                    if let Ok(mut engine) = engine_for_commands.lock() {
+                        engine.set_track_pan(track_idx, pan);
+                    }
+                }
+                GuiCommand::SetTrackMute { track_idx, mute } => {
+                    if let Ok(mut engine) = engine_for_commands.lock() {
+                        engine.set_track_mute(track_idx, mute);
+                    }
+                }
+                GuiCommand::SetTrackSolo { track_idx, solo } => {
+                    if let Ok(mut engine) = engine_for_commands.lock() {
+                        engine.set_track_solo(track_idx, solo);
+                    }
+                }
                 _ => {}
             }
         }

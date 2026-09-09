@@ -264,6 +264,15 @@ pub struct AudioEngine<'a> {
     /// La GUI lo lee para el vúmetro: 0.0 == silencio == -inf dB.
     /// Sin esto el vúmetro dibujaba el fader y mentía en áreas sin audio.
     pub output_level_bits: Arc<AtomicU32>,
+    /// Per-track volume (0.0..1.0), indexado por track_index.
+    /// 16 pistas máximas (TrackMatrix limit).
+    pub track_volumes: [f32; 16],
+    /// Per-track pan (-100.0..100.0), indexado por track_index.
+    pub track_pans: [f32; 16],
+    /// Per-track mute flag, indexado por track_index.
+    pub track_mutes: [bool; 16],
+    /// Per-track solo flag, indexado por track_index.
+    pub track_solos: [bool; 16],
 }
 
 impl<'a> AudioEngine<'a> {
@@ -283,6 +292,10 @@ impl<'a> AudioEngine<'a> {
             position_clock,
             absolute_frame: 0,
             output_level_bits: Arc::new(AtomicU32::new(0.0f32.to_bits())),
+            track_volumes: [0.75; 16],
+            track_pans: [0.0; 16],
+            track_mutes: [false; 16],
+            track_solos: [false; 16],
         }
     }
 
@@ -309,6 +322,30 @@ impl<'a> AudioEngine<'a> {
         self.sample_rate = new_sr;
         self.transport.sample_rate = hikaru_core::SampleRate::new(new_sr);
         self.main_filter.set_params(2000.0, 0.707, new_sr);
+    }
+
+    pub fn set_track_volume(&mut self, track_idx: usize, volume: f32) {
+        if track_idx < 16 {
+            self.track_volumes[track_idx] = volume.clamp(0.0, 1.0);
+        }
+    }
+
+    pub fn set_track_pan(&mut self, track_idx: usize, pan: f32) {
+        if track_idx < 16 {
+            self.track_pans[track_idx] = pan.clamp(-100.0, 100.0);
+        }
+    }
+
+    pub fn set_track_mute(&mut self, track_idx: usize, mute: bool) {
+        if track_idx < 16 {
+            self.track_mutes[track_idx] = mute;
+        }
+    }
+
+    pub fn set_track_solo(&mut self, track_idx: usize, solo: bool) {
+        if track_idx < 16 {
+            self.track_solos[track_idx] = solo;
+        }
     }
 
     /// Limpia los clips anteriores y sincroniza la nueva lista que llega desde la GUI
@@ -632,7 +669,40 @@ impl<'a> AudioEngine<'a> {
             let transport = self.transport;
             let mode = self.mode;
 
+            // Pre-compute per-track gain (volume + pan + mute/solo logic).
+            let any_solo = self.track_solos.iter().any(|&s| s);
+            let mut track_gain_l = [0.0f32; 16];
+            let mut track_gain_r = [0.0f32; 16];
+            for t in 0..16 {
+                let vol = self.track_volumes[t];
+                let muted = self.track_mutes[t];
+                let soloed = self.track_solos[t];
+                let effective_gain = if muted {
+                    0.0
+                } else if any_solo && !soloed {
+                    0.0
+                } else {
+                    vol
+                };
+                // Linear pan law: center=unity, full L/R=crossfade.
+                // pan: -100 (L) .. 0 (C) .. +100 (R)
+                let pan_norm = self.track_pans[t] / 100.0; // -1..+1
+                track_gain_l[t] = effective_gain * if pan_norm > 0.0 {
+                    1.0 - pan_norm
+                } else {
+                    1.0
+                };
+                track_gain_r[t] = effective_gain * if pan_norm < 0.0 {
+                    1.0 + pan_norm
+                } else {
+                    1.0
+                };
+            }
+
             for clip in self.clips.iter_mut() {
+                let ti = clip.track_index.min(15);
+                let gl = track_gain_l[ti];
+                let gr = track_gain_r[ti];
                 if mode == EngineMode::OpenStudio {
                     let clip_frame_end = clip.start_frame.saturating_add(clip.duration_frames);
                     let offset_frames = clip.sample_offset / clip.channels.max(1);
@@ -643,9 +713,9 @@ impl<'a> AudioEngine<'a> {
                         }
                         let relative_frame = (global_frame - clip.start_frame) as usize;
                         let src_frame = offset_frames.saturating_add(relative_frame);
-                        let l = clip.read_sample(src_frame);
+                        let l = clip.read_sample(src_frame) * gl;
                         if l == 0.0 {
-                            let r = clip.read_sample_r(src_frame);
+                            let r = clip.read_sample_r(src_frame) * gr;
                             if r == 0.0 {
                                 continue;
                             }
@@ -653,7 +723,7 @@ impl<'a> AudioEngine<'a> {
                             samples[out_r_idx] += r;
                             continue;
                         }
-                        let r = clip.read_sample_r(src_frame);
+                        let r = clip.read_sample_r(src_frame) * gr;
                         let out_l_idx = f * num_channels;
                         let out_r_idx = out_l_idx + 1;
                         samples[out_l_idx] += l;
@@ -683,8 +753,8 @@ impl<'a> AudioEngine<'a> {
                         };
 
                         let src_frame = offset_frames.saturating_add(relative_frame);
-                        let l = clip.read_sample(src_frame);
-                        let r = clip.read_sample_r(src_frame);
+                        let l = clip.read_sample(src_frame) * gl;
+                        let r = clip.read_sample_r(src_frame) * gr;
                         if l == 0.0 && r == 0.0 {
                             continue;
                         }
@@ -727,7 +797,12 @@ mod tests {
 
     fn test_engine() -> AudioEngine<'static> {
         let clock = Arc::new(AtomicU64::new(0));
-        AudioEngine::new(SampleRate::new(44100.0), &TABLE, clock)
+        let mut engine = AudioEngine::new(SampleRate::new(44100.0), &TABLE, clock);
+        // Unity gain for all tracks in tests (bypass per-track volume)
+        for t in 0..16 {
+            engine.track_volumes[t] = 1.0;
+        }
+        engine
     }
 
     fn run_frames(engine: &mut AudioEngine, frames: u64) {
