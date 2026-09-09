@@ -19,6 +19,55 @@ use hikaru_transport::{TransportPlaybackState, TransportPosition};
 /// Pre-asignado una vez, cero heap alloc en el audio thread.
 const MAX_TRACK_BUF: usize = 2048 * 2;
 
+// ── Denormal Protection (FTZ/DAZ) ──────────────────────────────────────
+// Los denormals (< 1.18e-38 en f36) causan penalizaciones severas de CPU
+// en x86 anteriores a Haswell. Protegemos con:
+// 1. MXCSR FTZ+DAZ en x86/x86_64 ( hardware flush )
+// 2. Software flush como fallback (banco de bits)
+
+/// Save original MXCSR to restore later (if needed).
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+static ORIGINAL_MXCSR: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+
+/// Habilitar FTZ (Flush-to-Zero) y DAZ (Denormals-Are-Zero) en MXCSR.
+/// Llamar UNA VEZ al inicio del thread de audio. Restaura al final.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+pub fn enable_ftz_daz() {
+    unsafe {
+        let mut mxcsr: u32 = 0;
+        std::arch::asm!("stmxcsr [{}]", in(reg) &mut mxcsr as *mut u32, options(nostack));
+        let _ = ORIGINAL_MXCSR.set(mxcsr);
+        // Bit 15: Flush-to-Zero
+        // Bit 6:  Denormals-Are-Zero
+        mxcsr |= (1 << 15) | (1 << 6);
+        std::arch::asm!("ldmxcsr [{}]", in(reg) &mxcsr as *const u32, options(nostack));
+    }
+}
+
+/// Restaurar MXCSR original.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+pub fn restore_mxcsr() {
+    if let Some(&original) = ORIGINAL_MXCSR.get() {
+        unsafe {
+            std::arch::asm!("ldmxcsr [{}]", in(reg) &original as *const u32);
+        }
+    }
+}
+
+/// Software denormal flush para plataformas no-x86.
+/// Reemplaza valores subnormales (< f32::MIN_POSITIVE) por 0.0.
+/// Operación branchless: compara bits del exponente.
+#[inline(always)]
+pub fn flush_denormals(buf: &mut [f32]) {
+    for s in buf.iter_mut() {
+        let bits = s.to_bits();
+        // Exponente = 0 → denormal o cero. Pre-1.0 → preserva signo.
+        if (bits & 0x7F800000) == 0 && bits != 0 {
+            *s = 0.0;
+        }
+    }
+}
+
 use crate::preview_player::PreviewPlayer;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -756,35 +805,47 @@ impl<'a> AudioEngine<'a> {
                 let gr = track_gain_r[ti];
                 let track_buf = &mut self.track_output_bufs[ti];
 
+                // ── Precomputar por clip (una sola vez, no por sample) ──
+                let ch = clip.channels.max(1);
+                let buf_ptr = clip.samples.as_ptr();
+                let buf_len = clip.samples.len();
+                let offset_frames = clip.sample_offset / ch;
+                let has_loop = clip.has_valid_clip_loop();
+
                 if mode == EngineMode::OpenStudio {
                     let clip_frame_end = clip.start_frame.saturating_add(clip.duration_frames);
-                    let offset_frames = clip.sample_offset / clip.channels.max(1);
                     for f in 0..buffer_frames as usize {
                         let global_frame = transport.wrap_sample_count(frame_start + f as u64);
                         if global_frame < clip.start_frame || global_frame >= clip_frame_end {
                             continue;
                         }
                         let relative_frame = (global_frame - clip.start_frame) as usize;
-                        let src_frame = offset_frames.saturating_add(relative_frame);
-                        let l = clip.read_sample(src_frame) * gl;
-                        let r = clip.read_sample_r(src_frame) * gr;
-                        // Acumular siempre: add 0.0 es gratis y evita branch miss.
-                        track_buf[f * 2] += l;
-                        track_buf[f * 2 + 1] += r;
+                        let idx = (offset_frames + relative_frame) * ch;
+
+                        // Fast-path: direct indexing sin bounds check repetido.
+                        if idx + ch <= buf_len {
+                            let l = unsafe { *buf_ptr.add(idx) } * gl;
+                            let r = if ch > 1 {
+                                (unsafe { *buf_ptr.add(idx + 1) }) * gr
+                            } else {
+                                l
+                            };
+                            track_buf[f * 2] += l;
+                            track_buf[f * 2 + 1] += r;
+                        }
                     }
                 } else {
                     if !clip.is_playing {
                         continue;
                     }
 
-                    let offset_frames = clip.sample_offset / clip.channels.max(1);
                     let emission = clip.emission_len_frames();
-                    let xfade_frames: usize = if clip.has_valid_clip_loop() { 32 } else { 0 };
+                    let xfade_frames: usize = if has_loop { 32 } else { 0 };
                     let mut clip_finished = false;
                     for f in 0..buffer_frames as usize {
                         let abs = abs_start + f as u64;
 
-                        if !clip.has_valid_clip_loop() && abs >= clip.start_absolute {
+                        if !has_loop && abs >= clip.start_absolute {
                             let elapsed = abs - clip.start_absolute;
                             if elapsed > 0 && elapsed >= emission {
                                 clip_finished = true;
@@ -796,46 +857,54 @@ impl<'a> AudioEngine<'a> {
                             continue;
                         };
 
-                        let src_frame = offset_frames.saturating_add(relative_frame);
+                        let idx = (offset_frames + relative_frame) * ch;
 
                         // ── MICRO-CROSSFADE en loop boundary ──
-                        // Detectar wrap: frame actual < frame anterior
-                        // (el módulo saltó de ~loop_end a ~loop_start).
                         if xfade_frames > 0
                             && clip.prev_frame != usize::MAX
                             && relative_frame < clip.prev_frame
                             && clip.prev_frame - relative_frame > (emission / 2) as usize
                         {
-                            // Iniciar crossfade de32 samples.
                             clip.xfade_remaining = xfade_frames as u32;
                             clip.xfade_len = xfade_frames as u32;
                         }
 
-                        if clip.xfade_remaining > 0 {
-                            // Crossfade: mezclar muestra actual con la
-                            // muestra del frame anterior (fin del loop).
+                        if clip.xfade_remaining > 0 && idx + ch <= buf_len {
                             let fade_pos = clip.xfade_len - clip.xfade_remaining;
                             let fade_total = clip.xfade_len as f32;
-                            let out_gain = fade_pos as f32 / fade_total;   // 0→1
-                            let in_gain = 1.0 - out_gain;                  // 1→0
+                            let out_gain = fade_pos as f32 / fade_total;
+                            let in_gain = 1.0 - out_gain;
 
-                            // Muestra "nueva" (inicio del loop).
-                            let l_new = clip.read_sample(src_frame) * gl;
-                            let r_new = clip.read_sample_r(src_frame) * gr;
+                            let l_new = unsafe { *buf_ptr.add(idx) } * gl;
+                            let r_new = if ch > 1 {
+                                (unsafe { *buf_ptr.add(idx + 1) }) * gr
+                            } else {
+                                l_new
+                            };
 
-                            // Muestra "vieja" (fin del loop anterior).
-                            let prev_src = offset_frames.saturating_add(clip.prev_frame);
-                            let l_old = clip.read_sample(prev_src) * gl;
-                            let r_old = clip.read_sample_r(prev_src) * gr;
+                            let prev_idx = (offset_frames + clip.prev_frame) * ch;
+                            let (l_old, r_old) = if prev_idx + ch <= buf_len {
+                                let lo = unsafe { *buf_ptr.add(prev_idx) } * gl;
+                                let ro = if ch > 1 {
+                                    (unsafe { *buf_ptr.add(prev_idx + 1) }) * gr
+                                } else {
+                                    lo
+                                };
+                                (lo, ro)
+                            } else {
+                                (0.0, 0.0)
+                            };
 
                             track_buf[f * 2] += l_old * in_gain + l_new * out_gain;
                             track_buf[f * 2 + 1] += r_old * in_gain + r_new * out_gain;
-
                             clip.xfade_remaining -= 1;
-                        } else {
-                            // Lectura normal sin crossfade.
-                            let l = clip.read_sample(src_frame) * gl;
-                            let r = clip.read_sample_r(src_frame) * gr;
+                        } else if idx + ch <= buf_len {
+                            let l = unsafe { *buf_ptr.add(idx) } * gl;
+                            let r = if ch > 1 {
+                                (unsafe { *buf_ptr.add(idx + 1) }) * gr
+                            } else {
+                                l
+                            };
                             track_buf[f * 2] += l;
                             track_buf[f * 2 + 1] += r;
                         }
@@ -878,6 +947,11 @@ impl<'a> AudioEngine<'a> {
                 p.store(0.0f32.to_bits(), Ordering::Relaxed);
             }
         }
+
+        // ── Denormal flush ──
+        // Previene CPU stalls en x86 pre-Haswell por subnormales.
+        // Flush una sola vez sobre el buffer master (no por track).
+        flush_denormals(samples);
 
         // Pico real del bloque (preview + clips mix) para el vúmetro master.
         // Soft-clipper: tanh() satura suavemente sin hard-clip artifacts.

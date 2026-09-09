@@ -396,9 +396,14 @@ fn init_cpal_stream(
 
     // ── 3. Construir el stream ──
     let engine_cb = engine.clone();
+    let ftz_init = std::sync::Once::new();
     let stream = device.build_output_stream(
         stream_config,
         move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+            // FTZ/DAZ: una sola vez en el primer callback del thread de audio.
+            ftz_init.call_once(|| {
+                hikaru_audio_engine::enable_ftz_daz();
+            });
             data.fill(0.0);
             match engine_cb.try_lock() {
                 Ok(mut lock) => {
