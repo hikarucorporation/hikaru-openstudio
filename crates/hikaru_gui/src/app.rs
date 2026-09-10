@@ -55,6 +55,14 @@ fn sync_matrix_mixer_bidirectional(
     }
 
     // 3. Sincronizar parámetros por track (matrix ↔ mixer → engine)
+    //
+    // IMPORTANT: The Session Matrix stores clips at 0-based track indices
+    // (`LoadClip { track_index: track_idx }` where `track_idx` is the grid
+    // row). The AudioEngine indexes clips by this same `track_index`.
+    // Therefore all engine parameter commands (volume, pan, mute, solo)
+    // MUST use the 0-based matrix index `i`, NOT `mixer_idx` (= i + 1).
+    // Using `mixer_idx` would target the WRONG engine track, causing
+    // secondary tracks to play uncontrolled (chopped/desynced audio).
     for i in 0..matrix_len {
         let mixer_idx = i + 1;
         if mixer_idx >= live_tracks.len() { break; }
@@ -87,7 +95,7 @@ fn sync_matrix_mixer_bidirectional(
         } else if mixer_changed {
             matrix_state.tracks[i].volume = t.volume;
             audio_proxy.send(GuiCommand::SetTrackVolume {
-                track_idx: mixer_idx,
+                track_idx: i,
                 volume_db: t.volume,
             });
         }
@@ -100,7 +108,7 @@ fn sync_matrix_mixer_bidirectional(
         } else if mixer_changed {
             matrix_state.tracks[i].pan = t.pan;
             audio_proxy.send(GuiCommand::SetTrackPan {
-                track_idx: mixer_idx,
+                track_idx: i,
                 pan: t.pan,
             });
         }
@@ -111,13 +119,13 @@ fn sync_matrix_mixer_bidirectional(
         if matrix_changed && !mixer_changed {
             t.mute = mx_muted;
             audio_proxy.send(GuiCommand::SetTrackMute {
-                track_idx: mixer_idx,
+                track_idx: i,
                 mute: t.mute,
             });
         } else if mixer_changed {
             matrix_state.tracks[i].muted = t.mute;
             audio_proxy.send(GuiCommand::SetTrackMute {
-                track_idx: mixer_idx,
+                track_idx: i,
                 mute: t.mute,
             });
         }
@@ -128,13 +136,13 @@ fn sync_matrix_mixer_bidirectional(
         if matrix_changed && !mixer_changed {
             t.solo = mx_soloed;
             audio_proxy.send(GuiCommand::SetTrackSolo {
-                track_idx: mixer_idx,
+                track_idx: i,
                 solo: t.solo,
             });
         } else if mixer_changed {
             matrix_state.tracks[i].soloed = t.solo;
             audio_proxy.send(GuiCommand::SetTrackSolo {
-                track_idx: mixer_idx,
+                track_idx: i,
                 solo: t.solo,
             });
         }
