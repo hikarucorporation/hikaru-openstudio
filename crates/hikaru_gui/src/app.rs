@@ -627,9 +627,16 @@ impl eframe::App for HikaruApp {
             };
 
             // Capturar estado viejo del mixer ANTES del render
-            let old_live: Vec<(f32, f32, bool, bool)> = self.live_tracks.iter()
-                .map(|t| (t.volume, t.pan, t.mute, t.solo))
-                .collect();
+            // (del track list ACTIVO según el modo: live o studio).
+            let old_live: Vec<(f32, f32, bool, bool)> = {
+                let active = match self.mode {
+                    AppMode::OpenLive => &self.live_tracks,
+                    AppMode::OpenStudio => &self.studio_tracks,
+                };
+                active.iter()
+                    .map(|t| (t.volume, t.pan, t.mute, t.solo))
+                    .collect()
+            };
 
             ctx.show_viewport_immediate(
                 ViewportId::from_hash_of("hikaru_mixer_viewport"),
@@ -649,6 +656,25 @@ impl eframe::App for HikaruApp {
             );
 
             // SYNC POST-MIXER: sincronización bidireccional Matrix ↔ Mixer → Engine
+            // Master fader: el track 0 del mixer controla la ganancia master
+            // del engine. Su valor NO se sincroniza con la matrix (el master
+            // no tiene track en la matrix), solo se envía al engine cuando
+            // el fader cambia.
+            {
+                let active = match self.mode {
+                    AppMode::OpenLive => &self.live_tracks,
+                    AppMode::OpenStudio => &self.studio_tracks,
+                };
+                if let Some(old_master_vol) = old_live.first().map(|m| m.0) {
+                    let master = &active[0];
+                    if (master.volume - old_master_vol).abs() > f32::EPSILON {
+                        self.audio_proxy.send(GuiCommand::SetMasterVolume {
+                            volume_db: master.volume,
+                        });
+                    }
+                }
+            }
+
             if self.mode == AppMode::OpenLive {
                 sync_matrix_mixer_bidirectional(
                     &mut self.live_tracks,

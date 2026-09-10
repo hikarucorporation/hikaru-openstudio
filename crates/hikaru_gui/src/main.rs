@@ -269,6 +269,11 @@ fn main() -> Result<(), eframe::Error> {
                         engine.set_track_solo(track_idx, solo);
                     }
                 }
+                GuiCommand::SetMasterVolume { volume_db } => {
+                    if let Ok(engine) = engine_for_commands.try_lock() {
+                        engine.set_master_gain(volume_db);
+                    }
+                }
                 _ => {}
             }
         }

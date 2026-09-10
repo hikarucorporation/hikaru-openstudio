@@ -348,6 +348,11 @@ pub struct AudioEngine<'a> {
     pub track_mutes: [AtomicBool; 16],
     /// Per-track solo flag, indexado por track_index.
     pub track_solos: [AtomicBool; 16],
+    /// Ganancia master (0.0..1.0). Controla el volumen de salida final
+    /// de TODA la mezcla. Se aplica DESPUÉS de sumar todos los tracks
+    /// y ANTES del soft-clipper (tanh). AtomicU32 para read lock-free
+    /// desde el audio thread.
+    pub master_gain: AtomicU32,
 }
 
 impl<'a> AudioEngine<'a> {
@@ -373,6 +378,7 @@ impl<'a> AudioEngine<'a> {
             track_pans: std::array::from_fn(|_| AtomicU32::new(0.0f32.to_bits())),
             track_mutes: std::array::from_fn(|_| AtomicBool::new(false)),
             track_solos: std::array::from_fn(|_| AtomicBool::new(false)),
+            master_gain: AtomicU32::new(0.75f32.to_bits()),
         }
     }
 
@@ -432,6 +438,10 @@ impl<'a> AudioEngine<'a> {
         if track_idx < 16 {
             self.track_solos[track_idx].store(solo, Ordering::Relaxed);
         }
+    }
+
+    pub fn set_master_gain(&self, volume: f32) {
+        self.master_gain.store(volume.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
     }
 
     /// Limpia los clips anteriores y sincroniza la nueva lista que llega desde la GUI
@@ -953,6 +963,18 @@ impl<'a> AudioEngine<'a> {
         // Flush una sola vez sobre el buffer master (no por track).
         flush_denormals(samples);
 
+        // ── MASTER GAIN ──
+        // Ganancia master (fader MASTER del mixer). Se aplica DESPUÉS del
+        // flush de denormals y ANTES del soft-clipper (tanh), así la
+        // escala lineal del fader controla el nivel que entra al saturador.
+        // Lectura atómica lock-free: una sola por bloque, branchless.
+        let mg = f32::from_bits(self.master_gain.load(Ordering::Relaxed));
+        if mg != 1.0 {
+            for s in samples.iter_mut() {
+                *s *= mg;
+            }
+        }
+
         // Pico real del bloque (preview + clips mix) para el vúmetro master.
         // Soft-clipper: tanh() satura suavemente sin hard-clip artifacts.
         // Mantiene la forma de onda y previene clipping de la placa.
@@ -985,6 +1007,8 @@ mod tests {
         for t in 0..16 {
             engine.track_volumes[t].store(1.0f32.to_bits(), Ordering::Relaxed);
         }
+        // Unity gain for master fader in tests (bypass master volume)
+        engine.master_gain.store(1.0f32.to_bits(), Ordering::Relaxed);
         engine
     }
 
