@@ -56,6 +56,30 @@ pub fn show(ui: &mut Ui, app: &mut HikaruApp) {
 
         // --- VIEW ---
         ui.menu_button("VIEW", |ui| {
+            // Submenú OpenLive (Ableton-style workflow)
+            ui.menu_button("🎛 OpenLive View", |ui| {
+                if ui.button("🔲 Session Matrix (Tab)").clicked() {
+                    app.mode = AppMode::OpenLive;
+                    // TODO: Activar pestaña Session Matrix
+                    ui.close_menu();
+                }
+                if ui.button("🎼 Arranger View (Tab)").clicked() {
+                    app.mode = AppMode::OpenLive;
+                    // TODO: Activar pestaña Arranger View
+                    ui.close_menu();
+                }
+            });
+
+            // Submenú OpenStudio (FL Studio/Traditional workflow)
+            ui.menu_button("🎧 OpenStudio View", |ui| {
+                if ui.button("🎹 Playlist / Timeline (F5)").clicked() {
+                    app.mode = AppMode::OpenStudio;
+                    ui.close_menu();
+                }
+            });
+
+            ui.separator();
+
             if ui.button("🎛 Mixer (F9)").clicked() {
                 app.show_mixer = !app.show_mixer;
                 ui.close_menu();

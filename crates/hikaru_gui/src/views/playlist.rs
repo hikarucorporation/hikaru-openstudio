@@ -32,7 +32,7 @@ impl<'a> ViewMode<'a> {
 
     fn header_label(&self) -> String {
         match self {
-            ViewMode::Arranger => "PLAYLIST / ARRANGEMENT".to_string(),
+            ViewMode::Arranger => "PLAYLIST / TIMELINE".to_string(),
             ViewMode::ClipEditor { title } => title.to_string(),
         }
     }
