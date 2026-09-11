@@ -1,6 +1,6 @@
 /*
  * Hikaru OpenStudio - Global Menu Bar
- * License: AGPL-3.0-only
+ * License: AGPL-3.0-or-later
  */
 
 use egui::Ui;
@@ -76,6 +76,8 @@ pub fn show(ui: &mut Ui, app: &mut HikaruApp) {
         // --- SETTINGS ---
         ui.menu_button("SETTINGS", |ui| {
             if ui.button("🔊 Audio Setup (JACK/ALSA/PipeWire)...").clicked() {
+                // Abrimos el modal nativo de Audio Setup
+                app.audio_settings_state.is_open = true;
                 ui.close_menu();
             }
             if ui.button("🎹 MIDI Devices...").clicked() {

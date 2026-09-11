@@ -84,7 +84,7 @@ impl FileExplorerState {
     }
 
     pub fn load_waveform_peaks(&mut self, path: &PathBuf, target_bins: usize) {
-        if self.cached_path.as_ref() == Some(path) && self.cached_waveform.len() == target_bins {
+        if self.cached_path.as_ref() == Some(path) && !self.cached_waveform.is_empty() {
             return;
         }
 
@@ -100,36 +100,42 @@ impl FileExplorerState {
 
             if total_samples > 0 {
                 let samples_per_bin = (total_samples / target_bins).max(1);
-                
+
                 match spec.sample_format {
                     hound::SampleFormat::Int => {
                         let max_val = (1 << (spec.bits_per_sample - 1)) as f32;
-                        let samples: Vec<i32> = reader.samples::<i32>().filter_map(|s| s.ok()).collect();
+                        let mut samples_iter = reader.samples::<i32>().filter_map(|s| s.ok());
+                        
                         for bin in 0..target_bins {
-                            let start = bin * samples_per_bin;
-                            let end = (start + samples_per_bin).min(samples.len());
                             let mut max_peak = 0.0_f32;
-                            for &s in &samples[start..end] {
-                                let abs_val = (s as f32 / max_val).abs();
-                                if abs_val > max_peak { max_peak = abs_val; }
+                            for _ in 0..samples_per_bin {
+                                if let Some(s) = samples_iter.next() {
+                                    let abs_val = (s as f32 / max_val).abs();
+                                    if abs_val > max_peak { max_peak = abs_val; }
+                                } else {
+                                    break;
+                                }
                             }
                             peaks[bin] = max_peak;
                         }
                     }
                     hound::SampleFormat::Float => {
-                        let samples: Vec<f32> = reader.samples::<f32>().filter_map(|s| s.ok()).collect();
+                        let mut samples_iter = reader.samples::<f32>().filter_map(|s| s.ok());
+                        
                         for bin in 0..target_bins {
-                            let start = bin * samples_per_bin;
-                            let end = (start + samples_per_bin).min(samples.len());
                             let mut max_peak = 0.0_f32;
-                            for &s in &samples[start..end] {
-                                let abs_val = s.abs();
-                                if abs_val > max_peak { max_peak = abs_val; }
+                            for _ in 0..samples_per_bin {
+                                if let Some(s) = samples_iter.next() {
+                                    let abs_val = s.abs();
+                                    if abs_val > max_peak { max_peak = abs_val; }
+                                } else {
+                                    break;
+                                }
                             }
                             peaks[bin] = max_peak;
                         }
                     }
-                };
+                }
             }
         }
 
@@ -340,7 +346,7 @@ pub fn show(
 
         if let Some(selected_path) = state.selected_file.clone() {
             let file_name = selected_path.file_name().unwrap_or_default().to_string_lossy().to_string();
-            let points_count = (rect.width() / 2.0).max(20.0) as usize;
+            let points_count = 150;
             state.load_waveform_peaks(&selected_path, points_count);
 
             let stroke = Stroke::new(1.5_f32, Color32::from_rgb(0, 230, 200));

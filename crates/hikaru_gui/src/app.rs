@@ -748,6 +748,7 @@ impl eframe::App for HikaruApp {
             }
         }
 
+        // --- VENTANA ABOUT ---
         if self.show_about {
             let about_title = match self.mode {
                 AppMode::OpenLive => "About Hikaru OpenLive",
@@ -767,7 +768,26 @@ impl eframe::App for HikaruApp {
 
                     CentralPanel::default().show(ctx, |ui| {
                         about::show(ui, self.mode);
-                        audio_settings::show(ctx, &mut self.audio_settings_state);
+                    });
+                },
+            );
+        }
+
+        // --- VENTANA AUDIO SETUP (SETTINGS) ---
+        if self.audio_settings_state.is_open {
+            ctx.show_viewport_immediate(
+                ViewportId::from_hash_of("hikaru_audio_settings_viewport"),
+                ViewportBuilder::default()
+                    .with_title("Audio Setup (JACK / ALSA / PipeWire)")
+                    .with_inner_size([440.0, 320.0])
+                    .with_resizable(false),
+                |ctx, _class| {
+                    if ctx.input(|i| i.viewport().close_requested()) {
+                        self.audio_settings_state.is_open = false;
+                    }
+
+                    CentralPanel::default().show(ctx, |ui| {
+                        audio_settings::show(ui, &mut self.audio_settings_state);
                     });
                 },
             );
