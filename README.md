@@ -50,6 +50,45 @@ cargo run --release -p hikaru_gui
 
 ---
 
+## Compilación Cruzada para Windows (Cross-compilation)
+
+Hikaru OpenStudio puede compilarse directamente desde Linux para generar el ejecutable nativo de Windows (`.exe`) utilizando el target GNU de Rust.
+
+### Requisitos previos
+
+Asegurate de tener instalado el toolchain y el linker cruzado en Debian/Ubuntu:
+
+```bash
+# Instalar el toolchain de Rust para Windows x86_64
+rustup target add x86_64-pc-windows-gnu
+
+# Instalar el compilador MinGW-w64
+sudo apt update && sudo apt install gcc-mingw-w64-x86-64
+
+```
+
+### Compilación
+
+Para generar el ejecutable optimizado de producción:
+
+```bash
+cargo build --release --target x86_64-pc-windows-gnu -p hikaru_gui
+
+```
+
+El binario resultante se encontrará en:
+`target/x86_64-pc-windows-gnu/release/hikaru_gui.exe`
+
+### Pruebas en Linux (Wine)
+
+Podés probar el ejecutable `.exe` directamente usando Wine:
+
+```bash
+wine target/x86_64-pc-windows-gnu/release/hikaru_gui.exe
+```
+
+---
+
 ## Licencia
 
 Este programa es software libre bajo los términos de la **GNU Affero General Public License (AGPLv3)**. Ver [`LICENSE`](https://www.gnu.org/licenses/agpl-3.0.en.html) para más detalles.

@@ -10,7 +10,7 @@ hikaru_core = { path = "../hikaru_core" }
 hikaru_audio_engine = { path = "../hikaru_audio_engine" }
 hikaru_transport = { path = "../hikaru_transport" }
 egui = "0.27.0"
-eframe = { version = "0.27.0", features = ["glow"] }
+eframe = { version = "0.27.2", features = ["wgpu"] }
 hound = "3.5"
 cpal = { version = "0.18.2", features = ["pulseaudio"] }
 [target.'cfg(target_os = "linux")'.dependencies]

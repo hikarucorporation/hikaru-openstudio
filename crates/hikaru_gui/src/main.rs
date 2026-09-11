@@ -36,7 +36,6 @@ fn main() -> Result<(), eframe::Error> {
         set_thread_realtime();
         while let Ok(command) = rx.recv() {
             match command {
-                // Sincronización del modo GUI -> Motor
                 GuiCommand::SetAppMode(is_studio) => {
                     if let Ok(mut engine) = engine_for_commands.lock() {
                         if is_studio {
@@ -117,14 +116,11 @@ fn main() -> Result<(), eframe::Error> {
                     }
                 }
                 GuiCommand::PreviewSample { path, volume, speed: _ } => {
-                    // Detener preview anterior inmediatamente.
                     if let Ok(mut engine) = engine_for_commands.lock() {
                         engine.preview_player.stop();
                         engine.preview_player.set_volume(volume);
                     }
 
-                    // Decodificar WAV en hilo background y cargar directamente
-                    // en el PreviewBuffer compartido (sin pasar por el channel).
                     let engine_clone = engine_for_commands.clone();
                     std::thread::spawn(move || {
                         let decoded = match decode_wav(&path) {
@@ -147,8 +143,6 @@ fn main() -> Result<(), eframe::Error> {
                             decoded.samples
                         };
 
-                        // Load directamente en el engine — sin pasar por el channel.
-                        // Esto evita el delay del mpsc y la ventana de silencio.
                         if let Ok(mut engine) = engine_clone.lock() {
                             engine.preview_player.play(final_samples, channels);
                         }
@@ -168,8 +162,6 @@ fn main() -> Result<(), eframe::Error> {
                 GuiCommand::SyncPlaylistClips { clips } => {
                     println!("[Hikaru Engine] Sincronizando {} clips de Playlist...", clips.len());
 
-                    // Paso 1: Decodificar y resamplear TODOS los clips FUERA del lock.
-                    // Esto evita que el audio thread quede bloqueado durante I/O de disco.
                     let target_sr = if let Ok(engine) = engine_for_commands.try_lock() {
                         engine.sample_rate
                     } else {
@@ -203,7 +195,7 @@ fn main() -> Result<(), eframe::Error> {
                             decoded_clips.push((
                                 clip_data.clip_id,
                                 clip_data.track_index,
-                                0, // scene_index: Playlist es lineal
+                                0,
                                 final_samples,
                                 clip_data.start_secs,
                                 clip_data.duration_secs,
@@ -215,7 +207,6 @@ fn main() -> Result<(), eframe::Error> {
                         }
                     }
 
-                    // Paso 2: Agregar clips al engine (solo la mutación, sin I/O).
                     if let Ok(mut engine) = engine_for_commands.lock() {
                         engine.clips.retain(|c| c.is_matrix_clip);
                         for (clip_id, track_index, scene_index, samples, start, duration, offset, channels) in decoded_clips {
@@ -249,7 +240,6 @@ fn main() -> Result<(), eframe::Error> {
                     }
                 }
                 GuiCommand::SetTrackVolume { track_idx, volume_db } => {
-                    // Lock-free: atomic store, no mutex needed.
                     if let Ok(engine) = engine_for_commands.try_lock() {
                         engine.set_track_volume(track_idx, volume_db);
                     }
@@ -290,26 +280,22 @@ fn main() -> Result<(), eframe::Error> {
         }
     };
 
-    // SR real del hardware (44100/48000/...): el engine ya se actualizó en
-    // `init_cpal_stream`; la GUI debe usar el MISMO valor o el cursor corre
-    // desincronizado del audio. Se lee del engine y se inyecta en el
-    // transporte GUI al crear la app.
     let hardware_sr: f32 = engine_arc
         .lock()
         .map(|engine| engine.sample_rate)
         .unwrap_or(44100.0);
 
-    // Pico real de salida para el vúmetro (0.0 == -inf dB en silencio).
-    // Se clona el Arc del engine: el callback publica, la GUI solo lee.
     let output_level_bits = engine_arc
         .lock()
         .map(|engine| engine.output_level_bits.clone())
         .unwrap_or_else(|_| std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)));
 
+    use eframe::egui;
+
     let native_options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("Hikaru OpenStudio")
-            .with_inner_size([1280.0, 720.0]),
+        viewport: egui::ViewportBuilder::default().with_inner_size([1280.0, 720.0]),
+        #[cfg(target_os = "windows")]
+        renderer: eframe::Renderer::Wgpu,
         ..Default::default()
     };
 
@@ -317,9 +303,9 @@ fn main() -> Result<(), eframe::Error> {
         "Hikaru OpenStudio",
         native_options,
         Box::new(move |cc| {
-            // Handle compartido al engine para el polling por frame de la
-            // Session Matrix: la GUI lee `is_playing` / `VoiceState` con
-            // `try_lock` y apaga el pad en verde al terminar la voz.
+            // FORZAR MODO OSCURO EN EGUI INDEPENDIENTEMENTE DEL TEMA DEL SISTEMA OPERATIVO
+            cc.egui_ctx.set_visuals(egui::Visuals::dark());
+
             let mut app = HikaruApp::new(
                 cc,
                 audio_proxy,
@@ -328,7 +314,6 @@ fn main() -> Result<(), eframe::Error> {
                 output_level_bits,
                 Some(engine_arc.clone()),
             );
-            // Transporte GUI con el SR real del motor (no 44100 fijo).
             app.sync_hardware_sample_rate(hardware_sr);
             Box::new(app)
         }),
@@ -338,22 +323,16 @@ fn main() -> Result<(), eframe::Error> {
 fn init_cpal_stream(
     engine: Arc<Mutex<hikaru_audio_engine::AudioEngine<'static>>>,
 ) -> Result<cpal::Stream, Box<dyn std::error::Error>> {
-    // ── 1. Seleccionar host PulseAudio explícitamente ──
-    // cpal::default_host() puede caer en ALSA directo en PipeWire,
-    // provocando que la placa ignore las muestras.
-    // PulseAudio es el backend que PipeWire emula, así que es el
-    // que registra la app como "sink-input" en `pactl`.
     let hosts = cpal::available_hosts();
     println!("[Hikaru] Hosts disponibles: {:?}", hosts);
 
+    #[cfg(target_os = "linux")]
     let host = cpal::host_from_id(cpal::HostId::PulseAudio)
         .unwrap_or_else(|_| cpal::default_host());
 
-    println!("[Hikaru] Host de audio: {}", host.id());
+    #[cfg(not(target_os = "linux"))]
+    let host = cpal::default_host();
 
-    // ── 1. Enumerar dispositivos de salida ──
-    // El default de PipeWire/ALSA puede ser un sink dummy, HDMI
-    // desconectado, o un monitor. Iteramos para encontrar la placa real.
     let devices: Vec<_> = host
         .output_devices()?
         .collect();
@@ -363,15 +342,12 @@ fn init_cpal_stream(
         println!("  [{}] {}", i, d);
     }
 
-    // Seleccionar el default; si es el único, usarlo directo.
-    // Si hay varios, preferir el default pero loguear la lista.
     let device = host
         .default_output_device()
         .ok_or("No se encontró dispositivo de salida de audio")?;
 
     println!("[Hikaru] Dispositivo SELECCIONADO: {}", device);
 
-    // ── 2. Configuración del dispositivo ──
     let supported_config = device.default_output_config()?;
     let device_format = supported_config.sample_format();
     let device_channels = supported_config.channels();
@@ -383,9 +359,6 @@ fn init_cpal_stream(
         supported_config.buffer_size()
     );
 
-    // Usar la config del dispositivo pero FORZAR buffer bajo para baja latencia.
-    // 1024 frames @ 48kHz ≈ 21ms: suficiente margen para el hilo de decode
-    // sin underruns, pero bajo enough para preview responsivo.
     let stream_config = cpal::StreamConfig {
         channels: supported_config.channels(),
         sample_rate: supported_config.sample_rate(),
@@ -399,13 +372,11 @@ fn init_cpal_stream(
         lock.set_sample_rate(hardware_sr);
     }
 
-    // ── 3. Construir el stream ──
     let engine_cb = engine.clone();
     let ftz_init = std::sync::Once::new();
     let stream = device.build_output_stream(
         stream_config,
         move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-            // FTZ/DAZ: una sola vez en el primer callback del thread de audio.
             ftz_init.call_once(|| {
                 hikaru_audio_engine::enable_ftz_daz();
             });
@@ -462,11 +433,6 @@ fn decode_wav(path: &str) -> Result<WavData, Box<dyn std::error::Error>> {
     Ok(WavData { samples, file_sr, channels })
 }
 
-/// Resampling lineal channel-aware. Procesa frame-by-frame para que la
-/// interpolación nunca cruce canales (L↔R), preservando la imagen estéreo.
-/// Set the current thread to SCHED_FIFO realtime priority on Linux.
-/// Priority 50 is a safe middle ground (range 1-99).
-/// Falls back silently on non-Linux or if permissions are insufficient.
 #[cfg(target_os = "linux")]
 fn set_thread_realtime() {
     unsafe {
