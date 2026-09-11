@@ -99,6 +99,8 @@ pub fn show(ui: &mut Ui, state: &mut AudioSettingsState) {
                     ui.selectable_value(&mut state.buffer_size, 256, "256 samples (~5.8 ms)");
                     ui.selectable_value(&mut state.buffer_size, 512, "512 samples (~11.6 ms)");
                     ui.selectable_value(&mut state.buffer_size, 1024, "1024 samples (~23.2 ms)");
+                    ui.selectable_value(&mut state.buffer_size, 2048, "2048 samples (~46.4 ms)");
+                    ui.selectable_value(&mut state.buffer_size, 4096, "4096 samples (~92.8 ms - Safe Mode)");
                 });
             ui.end_row();
         });

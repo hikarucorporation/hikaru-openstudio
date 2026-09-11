@@ -8,3 +8,4 @@ hikaru_core = { path = "../hikaru_core" }
 hikaru_transport = { path = "../hikaru_transport" }
 hikaru_sequencer = { path = "../hikaru_sequencer" }
 hikaru_dsp = { path = "../hikaru_dsp" }
+cpal = "0.18.2"

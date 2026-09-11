@@ -4,6 +4,7 @@
 // crates/hikaru_audio_engine/src/lib.rs
 
 pub mod preview_player;
+pub mod audio_drivers; // <--- Agregar esta línea
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;

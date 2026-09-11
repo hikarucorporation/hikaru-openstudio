@@ -1,0 +1,9 @@
+[package]
+name = "hikaru_audio_drivers"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+
+[dependencies]
+cpal = "0.18.2"
+hikaru_core = { path = "../hikaru_core" }
