@@ -9,6 +9,7 @@ members = [
     "crates/hikaru_dsp", # <--- EL GORDO DSP
     "crates/hikaru_plugin_host", # <--- EL GORDO PLUGINS
     "crates/hikaru_gui", # <--- interfaz
+    "crates/hikaru_audio_drivers", # <--- LOS DRIVERS PROPIOS OPEN-SOURCE (VAMO ARRIBA CARAJO KJJ)
 ]
 
 # Puedes añadir la sección [profile.release] aquí si quieres optimizar la compilación
