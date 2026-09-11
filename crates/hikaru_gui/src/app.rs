@@ -220,7 +220,7 @@ impl HikaruApp {
         output_level_bits: Arc<AtomicU32>,
         engine_handle: Option<Arc<Mutex<AudioEngine<'static>>>>,
     ) -> Self {
-        let sample_rate = SampleRate::new(44100.0);
+        let sample_rate = SampleRate::new(48000.0);
         let transport = TransportPosition::new(sample_rate, 140.0);
 
         let mut live_tracks = vec![

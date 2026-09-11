@@ -876,7 +876,7 @@ mod tests {
             AudioEngine::new(SampleRate::new(44100.0), &TABLE, clock);
         engine.set_mode(hikaru_audio_engine::EngineMode::OpenLive);
         // 1000 frames de audio real, disparo en t=0.
-        engine.add_clip(1, 0, 0, vec![0.5; 1000 * 2], 0.0, 0.0, 0.0, 2, true);
+        engine.add_clip(1, 0, 0, vec![0.5; 1000 * 2], 0.0, 0.0, 0.0, 2, true, engine.sample_rate);
         engine.trigger_clip(0, 0);
         assert!(engine.clips[0].is_playing);
 
@@ -898,7 +898,7 @@ mod tests {
         let mut engine =
             AudioEngine::new(SampleRate::new(44100.0), &TABLE, clock);
         engine.set_mode(hikaru_audio_engine::EngineMode::OpenLive);
-        engine.add_clip(1, 0, 0, vec![0.5; 1000 * 2], 0.0, 0.0, 0.0, 2, true);
+        engine.add_clip(1, 0, 0, vec![0.5; 1000 * 2], 0.0, 0.0, 0.0, 2, true, engine.sample_rate);
         // Sin trigger: is_playing == false → el pad Playing se apaga.
         let mut s = playing_state();
         assert_eq!(poll_engine_slots(&mut s, &engine), 1);

@@ -168,142 +168,8 @@ pub fn show(
         ui.ctx().request_repaint();
     }
 
-    // TopBottomPanel::bottom aislado para los controles y la Waveform
-    egui::TopBottomPanel::bottom("explorer_preview_footer")
-        .resizable(false)
-        .min_height(75.0)
-        .show_inside(ui, |ui| {
-            ui.add_space(4.0);
-            
-            // CONTROLES DE PREVIEW & VOLUME
-            ui.horizontal(|ui| {
-                let play_icon = if state.is_playing_preview { "⏸" } else { "▶" };
-                if ui.button(play_icon).clicked() {
-                    state.is_playing_preview = !state.is_playing_preview;
-                    if let Some(ref file) = state.selected_file {
-                        if state.is_playing_preview {
-                            audio_proxy.send(GuiCommand::SetPreviewVolume(state.preview_volume));
-                            audio_proxy.send(GuiCommand::PreviewSample {
-                                path: file.to_string_lossy().to_string(),
-                                volume: state.preview_volume,
-                                speed: state.current_speed(project_bpm),
-                            });
-                        } else {
-                            audio_proxy.send(GuiCommand::StopPreview);
-                        }
-                    }
-                }
-
-                ui.label(RichText::new("🔊").small());
-
-                ui.push_id("explorer_vol_slider_zone", |ui| {
-                    let volume_before = state.preview_volume;
-
-                    let _vol_response = ui.add(
-                        egui::Slider::new(&mut state.preview_volume, 0.0..=1.0)
-                            .show_value(false)
-                            .clamp_to_range(true)
-                    );
-
-                    if state.preview_volume != volume_before {
-                        audio_proxy.send(GuiCommand::SetPreviewVolume(state.preview_volume));
-                    }
-                });
-
-                ui.separator();
-
-                let sync_color = if state.is_synced { Color32::from_rgb(0, 220, 255) } else { Color32::GRAY };
-                if ui.add(egui::Button::new(RichText::new("Sync").small().color(sync_color))).clicked() {
-                    state.is_synced = !state.is_synced;
-                }
-
-                ui.add_sized(
-                    [50.0, 18.0],
-                    egui::DragValue::new(&mut state.sample_bpm)
-                        .speed(1.0)
-                        .clamp_range(40.0..=300.0)
-                        .suffix(" BPM")
-                );
-            });
-
-            ui.add_space(4.0);
-
-            // WAVEFORM + PLAYHEAD INTERACTIVO
-            let (rect, response) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 36.0), egui::Sense::click_and_drag());
-            
-            ui.painter().rect_filled(rect, 4.0, Color32::from_rgb(20, 22, 26));
-            ui.painter().rect_stroke(rect, 4.0, Stroke::new(1.0_f32, Color32::from_rgb(45, 50, 60)));
-
-            if let Some(selected_path) = state.selected_file.clone() {
-                let file_name = selected_path.file_name().unwrap_or_default().to_string_lossy().to_string();
-                let points_count = (rect.width() / 2.0).max(20.0) as usize;
-                state.load_waveform_peaks(&selected_path, points_count);
-
-                let stroke = Stroke::new(1.5_f32, Color32::from_rgb(0, 230, 200));
-                let center_y = rect.center().y;
-                let step = rect.width() / points_count as f32;
-                let max_h = rect.height() * 0.40;
-
-                if !state.cached_waveform.is_empty() {
-                    for (i, &amplitude) in state.cached_waveform.iter().enumerate() {
-                        let x = rect.min.x + (i as f32 * step);
-                        let h = (amplitude * max_h).max(1.0);
-                        ui.painter().line_segment(
-                            [Pos2::new(x, center_y - h), Pos2::new(x, center_y + h)],
-                            stroke,
-                        );
-                    }
-                }
-
-                let playhead_x = rect.min.x + (state.preview_position * rect.width());
-                ui.painter().line_segment(
-                    [Pos2::new(playhead_x, rect.min.y), Pos2::new(playhead_x, rect.max.y)],
-                    Stroke::new(2.0_f32, Color32::from_rgb(255, 80, 80)),
-                );
-
-                ui.painter().text(
-                    Pos2::new(rect.min.x + 6.0, rect.min.y + 3.0),
-                    egui::Align2::LEFT_TOP,
-                    &file_name,
-                    egui::FontId::proportional(10.0),
-                    Color32::WHITE,
-                );
-
-                if response.clicked() {
-                    if let Some(pointer_pos) = response.interact_pointer_pos() {
-                        let norm_x = ((pointer_pos.x - rect.min.x) / rect.width()).clamp(0.0, 1.0);
-                        state.preview_position = norm_x;
-                        state.is_playing_preview = true;
-
-                        audio_proxy.send(GuiCommand::SetPreviewVolume(state.preview_volume));
-                        audio_proxy.send(GuiCommand::PreviewSample {
-                            path: selected_path.to_string_lossy().to_string(),
-                            volume: state.preview_volume,
-                            speed: state.current_speed(project_bpm),
-                        });
-                    }
-                }
-
-                if response.drag_started() {
-                    *dragged_sample = Some(selected_path.clone());
-                    if state.is_playing_preview {
-                        state.is_playing_preview = false;
-                        audio_proxy.send(GuiCommand::StopPreview);
-                    }
-                }
-            } else {
-                ui.painter().text(
-                    rect.center(),
-                    egui::Align2::CENTER_CENTER,
-                    "Ningún sample seleccionado",
-                    egui::FontId::proportional(11.0),
-                    Color32::GRAY,
-                );
-            }
-        });
-
-    // --- PANEL CENTRAL: NAVEGACIÓN Y LISTA DE ARCHIVOS ---
-    egui::CentralPanel::default().show_inside(ui, |ui| {
+    ui.vertical(|ui| {
+        // --- BARRA SUPERIOR DE NAVEGACIÓN ---
         ui.horizontal(|ui| {
             if ui.add_enabled(!state.history_back.is_empty(), egui::Button::new("⮜")).clicked() {
                 state.go_back();
@@ -332,70 +198,212 @@ pub fn show(
         ui.add_space(4.0);
         ui.separator();
 
-        ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                if let Ok(entries) = fs::read_dir(&state.current_path) {
-                    let mut dirs = Vec::new();
-                    let mut files = Vec::new();
+        // --- PANEL CENTRAL: LISTA DE ARCHIVOS ---
+        let footer_height = 80.0;
+        let available_height = (ui.available_height() - footer_height).max(50.0);
 
-                    for entry in entries.flatten() {
-                        let path = entry.path();
-                        if path.is_dir() {
-                            dirs.push(path);
-                        } else if is_audio_file(&path) {
-                            files.push(path);
-                        }
-                    }
+        ui.allocate_ui_with_layout(
+            Vec2::new(ui.available_width(), available_height),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        if let Ok(entries) = fs::read_dir(&state.current_path) {
+                            let mut dirs = Vec::new();
+                            let mut files = Vec::new();
 
-                    dirs.sort();
-                    files.sort();
-
-                    for dir in dirs {
-                        let dir_name = dir.file_name().unwrap_or_default().to_string_lossy();
-                        if ui.add_sized([ui.available_width(), 18.0], egui::SelectableLabel::new(false, format!("📁 {}", dir_name))).clicked() {
-                            state.navigate_to(dir);
-                        }
-                    }
-
-                    for file in files {
-                        let file_name = file.file_name().unwrap_or_default().to_string_lossy();
-                        let is_selected = state.selected_file.as_ref() == Some(&file);
-
-                        let label_text = RichText::new(format!("🎵 {}", file_name))
-                            .color(if is_selected { Color32::from_rgb(0, 220, 255) } else { Color32::WHITE });
-
-                        let response = ui.add_sized([ui.available_width(), 18.0], egui::SelectableLabel::new(is_selected, label_text));
-
-                        if response.clicked() {
-                            state.selected_file = Some(file.clone());
-                            state.is_playing_preview = true;
-                            state.preview_position = 0.0;
-
-                            if let Some(detected_bpm) = parse_bpm_from_filename(&file_name) {
-                                state.sample_bpm = detected_bpm;
+                            for entry in entries.flatten() {
+                                let path = entry.path();
+                                if path.is_dir() {
+                                    dirs.push(path);
+                                } else if is_audio_file(&path) {
+                                    files.push(path);
+                                }
                             }
 
-                            audio_proxy.send(GuiCommand::SetPreviewVolume(state.preview_volume));
-                            audio_proxy.send(GuiCommand::PreviewSample {
-                                path: file.to_string_lossy().to_string(),
-                                volume: state.preview_volume,
-                                speed: state.current_speed(project_bpm),
-                            });
-                        }
+                            dirs.sort();
+                            files.sort();
 
-                        if response.drag_started() {
-                            *dragged_sample = Some(file.clone());
-                            if state.is_playing_preview {
-                                state.is_playing_preview = false;
-                                audio_proxy.send(GuiCommand::StopPreview);
+                            for dir in dirs {
+                                let dir_name = dir.file_name().unwrap_or_default().to_string_lossy();
+                                if ui.add_sized([ui.available_width(), 18.0], egui::SelectableLabel::new(false, format!("📁 {}", dir_name))).clicked() {
+                                    state.navigate_to(dir);
+                                }
                             }
+
+                            for file in files {
+                                let file_name = file.file_name().unwrap_or_default().to_string_lossy();
+                                let is_selected = state.selected_file.as_ref() == Some(&file);
+
+                                let label_text = RichText::new(format!("🎵 {}", file_name))
+                                    .color(if is_selected { Color32::from_rgb(0, 220, 255) } else { Color32::WHITE });
+
+                                let response = ui.add_sized([ui.available_width(), 18.0], egui::SelectableLabel::new(is_selected, label_text));
+
+                                if response.clicked() {
+                                    state.selected_file = Some(file.clone());
+                                    state.is_playing_preview = true;
+                                    state.preview_position = 0.0;
+
+                                    if let Some(detected_bpm) = parse_bpm_from_filename(&file_name) {
+                                        state.sample_bpm = detected_bpm;
+                                    }
+
+                                    audio_proxy.send(GuiCommand::SetPreviewVolume(state.preview_volume));
+                                    audio_proxy.send(GuiCommand::PreviewSample {
+                                        path: file.to_string_lossy().to_string(),
+                                        volume: state.preview_volume,
+                                        speed: state.current_speed(project_bpm),
+                                    });
+                                }
+
+                                if response.drag_started() {
+                                    *dragged_sample = Some(file.clone());
+                                    if state.is_playing_preview {
+                                        state.is_playing_preview = false;
+                                        audio_proxy.send(GuiCommand::StopPreview);
+                                    }
+                                }
+                            }
+                        } else {
+                            ui.label(RichText::new("⚠️ Permiso denegado o directorio no válido.").color(Color32::RED).small());
                         }
+                    });
+            },
+        );
+
+        ui.separator();
+
+        // --- FOOTER: PREVIEW, VOLUMEN Y WAVEFORM ---
+        ui.add_space(2.0);
+        
+        ui.horizontal(|ui| {
+            let play_icon = if state.is_playing_preview { "⏸" } else { "▶" };
+            if ui.button(play_icon).clicked() {
+                state.is_playing_preview = !state.is_playing_preview;
+                if let Some(ref file) = state.selected_file {
+                    if state.is_playing_preview {
+                        audio_proxy.send(GuiCommand::SetPreviewVolume(state.preview_volume));
+                        audio_proxy.send(GuiCommand::PreviewSample {
+                            path: file.to_string_lossy().to_string(),
+                            volume: state.preview_volume,
+                            speed: state.current_speed(project_bpm),
+                        });
+                    } else {
+                        audio_proxy.send(GuiCommand::StopPreview);
                     }
-                } else {
-                    ui.label(RichText::new("⚠️ Permiso denegado o directorio no válido.").color(Color32::RED).small());
+                }
+            }
+
+            ui.label(RichText::new("🔊").small());
+
+            ui.push_id("explorer_vol_slider_zone", |ui| {
+                let volume_before = state.preview_volume;
+
+                let _vol_response = ui.add(
+                    egui::Slider::new(&mut state.preview_volume, 0.0..=1.0)
+                        .show_value(false)
+                        .clamp_to_range(true)
+                );
+
+                if state.preview_volume != volume_before {
+                    audio_proxy.send(GuiCommand::SetPreviewVolume(state.preview_volume));
                 }
             });
+
+            ui.separator();
+
+            let sync_color = if state.is_synced { Color32::from_rgb(0, 220, 255) } else { Color32::GRAY };
+            if ui.add(egui::Button::new(RichText::new("Sync").small().color(sync_color))).clicked() {
+                state.is_synced = !state.is_synced;
+            }
+
+            ui.add_sized(
+                [50.0, 18.0],
+                egui::DragValue::new(&mut state.sample_bpm)
+                    .speed(1.0)
+                    .clamp_range(40.0..=300.0)
+                    .suffix(" BPM")
+            );
+        });
+
+        ui.add_space(4.0);
+
+        // WAVEFORM + PLAYHEAD INTERACTIVO
+        let (rect, response) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 36.0), egui::Sense::click_and_drag());
+        
+        ui.set_clip_rect(rect);
+
+        ui.painter().rect_filled(rect, 4.0, Color32::from_rgb(20, 22, 26));
+        ui.painter().rect_stroke(rect, 4.0, Stroke::new(1.0_f32, Color32::from_rgb(45, 50, 60)));
+
+        if let Some(selected_path) = state.selected_file.clone() {
+            let file_name = selected_path.file_name().unwrap_or_default().to_string_lossy().to_string();
+            let points_count = (rect.width() / 2.0).max(20.0) as usize;
+            state.load_waveform_peaks(&selected_path, points_count);
+
+            let stroke = Stroke::new(1.5_f32, Color32::from_rgb(0, 230, 200));
+            let center_y = rect.center().y;
+            let step = rect.width() / points_count as f32;
+            let max_h = rect.height() * 0.40;
+
+            if !state.cached_waveform.is_empty() {
+                for (i, &amplitude) in state.cached_waveform.iter().enumerate() {
+                    let x = rect.min.x + (i as f32 * step);
+                    let h = (amplitude * max_h).max(1.0);
+                    ui.painter().line_segment(
+                        [Pos2::new(x, center_y - h), Pos2::new(x, center_y + h)],
+                        stroke,
+                    );
+                }
+            }
+
+            let playhead_x = rect.min.x + (state.preview_position * rect.width());
+            ui.painter().line_segment(
+                [Pos2::new(playhead_x, rect.min.y), Pos2::new(playhead_x, rect.max.y)],
+                Stroke::new(2.0_f32, Color32::from_rgb(255, 80, 80)),
+            );
+
+            ui.painter().text(
+                Pos2::new(rect.min.x + 6.0, rect.min.y + 3.0),
+                egui::Align2::LEFT_TOP,
+                &file_name,
+                egui::FontId::proportional(10.0),
+                Color32::WHITE,
+            );
+
+            if response.clicked() {
+                if let Some(pointer_pos) = response.interact_pointer_pos() {
+                    let norm_x = ((pointer_pos.x - rect.min.x) / rect.width()).clamp(0.0, 1.0);
+                    state.preview_position = norm_x;
+                    state.is_playing_preview = true;
+
+                    audio_proxy.send(GuiCommand::SetPreviewVolume(state.preview_volume));
+                    audio_proxy.send(GuiCommand::PreviewSample {
+                        path: selected_path.to_string_lossy().to_string(),
+                        volume: state.preview_volume,
+                        speed: state.current_speed(project_bpm),
+                    });
+                }
+            }
+
+            if response.drag_started() {
+                *dragged_sample = Some(selected_path.clone());
+                if state.is_playing_preview {
+                    state.is_playing_preview = false;
+                    audio_proxy.send(GuiCommand::StopPreview);
+                }
+            }
+        } else {
+            ui.painter().text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "Ningún sample seleccionado",
+                egui::FontId::proportional(11.0),
+                Color32::GRAY,
+            );
+        }
     });
 }
 
