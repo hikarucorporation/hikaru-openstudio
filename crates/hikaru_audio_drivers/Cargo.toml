@@ -2,8 +2,13 @@
 name = "hikaru_audio_drivers"
 version = "0.1.0"
 edition = "2021"
-license = "AGPL-3.0-or-later"
+license = "LGPL-3.0-or-later"
 
 [dependencies]
-cpal = "0.18.2"
+alsa-sys = "0.4.0"
+# alsa-sys = "0.6.1"
+# alsa = "0.11" # Opcional: la capa segura idiomatic Rust sobre alsa-sys
 hikaru_core = { path = "../hikaru_core" }
+
+[patch.crates-io]
+alsa-sys = { version = "0.6.1" }

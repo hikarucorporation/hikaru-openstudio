@@ -1,6 +1,6 @@
 /*
  * Hikaru OpenStudio - Audio Setup Window
- * License: AGPL-3.0-only
+ * License: AGPL-3.0-or-later
  */
 
 use egui::{ComboBox, Grid, RichText, Color32, Ui};
@@ -11,6 +11,7 @@ pub enum AudioBackend {
     Jack,
     Alsa,
     PulseAudio,
+    HikaruNative,
 }
 
 pub struct AudioSettingsState {
@@ -26,11 +27,12 @@ impl Default for AudioSettingsState {
     fn default() -> Self {
         Self {
             is_open: false,
-            selected_backend: AudioBackend::PipeWire,
-            selected_device: "Default Output Device".to_string(),
+            selected_backend: AudioBackend::HikaruNative, // <-- Ponelo como predeterminado acá
+            selected_device: "Hikaru Low-Latency Engine".to_string(),
             sample_rate: 44100,
-            buffer_size: 512,
+            buffer_size: 128, // Para respuesta ultra rápida sin microtirones
             available_devices: vec![
+                "Hikaru Low-Latency Engine".to_string(),
                 "Default Output Device".to_string(),
                 "ALSA: PulseAudio / PipeWire Sound Server".to_string(),
                 "JACK Audio Connection Kit".to_string(),
@@ -51,7 +53,12 @@ pub fn show(ui: &mut Ui, state: &mut AudioSettingsState) {
         ComboBox::from_id_source("audio_backend_combo")
             .selected_text(format!("{:?}", state.selected_backend))
             .show_ui(ui, |ui| {
-                ui.selectable_value(&mut state.selected_backend, AudioBackend::PipeWire, "PipeWire (Recomendado)");
+                ui.selectable_value(
+                    &mut state.selected_backend, 
+                    AudioBackend::HikaruNative, 
+                    "Hikaru Native Audio Driver (Recomendado por el fabricante)"
+                );
+                ui.selectable_value(&mut state.selected_backend, AudioBackend::PipeWire, "PipeWire");
                 ui.selectable_value(&mut state.selected_backend, AudioBackend::Jack, "JACK (Baja Latencia)");
                 ui.selectable_value(&mut state.selected_backend, AudioBackend::Alsa, "ALSA (Nativo Linux)");
                 ui.selectable_value(&mut state.selected_backend, AudioBackend::PulseAudio, "PulseAudio");
