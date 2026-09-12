@@ -58,7 +58,7 @@ pub fn show(
                         Frame::group(ui.style()).show(ui, |ui| {
                             ui.vertical_centered(|ui| {
                                 ui.label(RichText::new(format!("TRK {:02}", i + 1)).strong());
-                                ui.label(RichText::new(format!("Audio {}", i + 1)).size(10.0));
+                                ui.label(RichText::new(format!("Track {}", i + 1)).size(10.0));
                             });
                         });
 
@@ -90,7 +90,7 @@ pub fn show(
                                 painter.text(
                                     slot_rect.center(),
                                     Align2::CENTER_CENTER,
-                                    format!("[ Clip {}-{} ]", i + 1, scene_idx + 1),
+                                    format!("[ Scene {}-{} ]", i + 1, scene_idx + 1),
                                     FontId::proportional(10.0),
                                     Color32::DARK_GRAY,
                                 );

@@ -99,7 +99,7 @@ impl Default for SessionMatrixState {
 
         let tracks = (0..initial_tracks)
             .map(|i| TrackMeta {
-                name: format!("Audio {}", i + 1),
+                name: format!("Track {}", i + 1),
                 muted: false,
                 soloed: false,
                 volume: 0.75,
