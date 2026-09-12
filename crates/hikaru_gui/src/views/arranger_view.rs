@@ -94,11 +94,15 @@ pub fn show(
                             ui.add_space(1.0); // Espacio inter-pad reducido
                         }
 
+                        // Espacio vertical para empujar el separador y los faders hacia abajo
+                        ui.add_space(130.0);
+
+                        // Separador ahora abajo, justo encima de los faders
                         ui.separator();
 
                         // Controles inferiores
                         ui.vertical_centered(|ui| {
-                            ui.add(Slider::new(&mut track.pan, -1.0..=1.0).show_value(false));
+                            ui.add(Slider::new(&mut track.pan, -100.0..=100.0).show_value(false));
                             ui.add(Slider::new(&mut track.volume, 0.0..=1.0).vertical());
                             ui.horizontal(|ui| {
                                 ui.toggle_value(&mut track.mute, "M");
