@@ -566,9 +566,7 @@ impl eframe::App for HikaruApp {
                         OpenLiveView::ArrangerView => {
                             crate::views::arranger_view::show(
                                 ui,
-                                &mut self.live_tracks, // <--- Modificado a &mut para poder mover los sliders/knobs
-                                // &self.live_tracks,
-                                &self.matrix_state,
+                                &mut self.live_tracks,
                                 &self.transport,
                                 &self.audio_proxy,
                             );
