@@ -156,6 +156,12 @@ pub enum AppMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenLiveView {
+    SessionMatrix,
+    ArrangerView,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PanMode {
     Stereo,
     MidSide,
@@ -209,6 +215,8 @@ pub struct HikaruApp {
     /// Fórmula: `smoothed = smoothed * 0.85 + raw * 0.15` por frame.
     pub smoothed_track_peaks: [f32; 16],
     pub smoothed_master_peak: f32,
+
+    pub openlive_view: OpenLiveView, // Subvista activa dentro de OpenLive
 }
 
 impl HikaruApp {
@@ -298,6 +306,7 @@ impl HikaruApp {
             track_peak_bits: track_peak_bits_init,
             smoothed_track_peaks: [0.0; 16],
             smoothed_master_peak: 0.0,
+            openlive_view: OpenLiveView::SessionMatrix,
         }
     }
 
@@ -465,6 +474,21 @@ impl eframe::App for HikaruApp {
         }
 
         ctx.input(|i| {
+            // Manejo del Tab según el modo activo
+            if i.key_pressed(egui::Key::Tab) {
+                match self.mode {
+                    AppMode::OpenLive => {
+                        self.openlive_view = match self.openlive_view {
+                            OpenLiveView::SessionMatrix => OpenLiveView::ArrangerView,
+                            OpenLiveView::ArrangerView => OpenLiveView::SessionMatrix,
+                        };
+                    }
+                    AppMode::OpenStudio => {
+                        self.mode = AppMode::OpenLive;
+                    }
+                }
+            }
+
             if i.key_pressed(egui::Key::F9) {
                 self.show_mixer = !self.show_mixer;
             }
@@ -511,34 +535,47 @@ impl eframe::App for HikaruApp {
             let engine_handle = self.engine_handle.clone();
             match self.mode {
                 AppMode::OpenLive => {
-                    // Tick exacto con PPQN único + BPM activo + SR real.
-                    // Sin hardcodear 960 ni fórmulas manuales divergentes.
-                    let ppqn = self.transport.ppqn();
-                    let current_tick = self.current_tick();
+                    match self.openlive_view {
+                        OpenLiveView::SessionMatrix => {
+                            // Tick exacto con PPQN único + BPM activo + SR real.
+                            // Sin hardcodear 960 ni fórmulas manuales divergentes.
+                            let ppqn = self.transport.ppqn();
+                            let current_tick = self.current_tick();
 
-                    matrix::show(
-                        ui,
-                        &mut self.matrix_state,
-                        &mut self.dragged_sample,
-                        &self.audio_proxy,
-                        current_tick,
-                        ppqn,
-                        self.transport.bpm,          // <--- Arg 7: f64
-                        self.transport.sample_rate.get() as u32, // <--- O .to_u32() / .0 dependiendo del enum
-                        self.transport.sample_count,
-                        // Loop global: la Session Matrix respeta la misma
-                        // región `[loop_start_ticks, loop_end_ticks]` y la
-                        // bandera `is_looping` (`loop_enabled`) que la
-                        // Playlist; el wrap se aplica en el bloque de
-                        // transporte (arriba) y en el display de matrix.rs.
-                        self.is_looping,
-                        self.playlist_state.loop_start_ticks,
-                        self.playlist_state.loop_end_ticks,
-                        engine_handle.as_ref(),
-                    );
+                            matrix::show(
+                                ui,
+                                &mut self.matrix_state,
+                                &mut self.dragged_sample,
+                                &self.audio_proxy,
+                                current_tick,
+                                ppqn,
+                                self.transport.bpm,          // <--- Arg 7: f64
+                                self.transport.sample_rate.get() as u32, // <--- O .to_u32() / .0 dependiendo del enum
+                                self.transport.sample_count,
+                                // Loop global: la Session Matrix respeta la misma
+                                // región `[loop_start_ticks, loop_end_ticks]` y la
+                                // bandera `is_looping` (`loop_enabled`) que la
+                                // Playlist; el wrap se aplica en el bloque de
+                                // transporte (arriba) y en el display de matrix.rs.
+                                self.is_looping,
+                                self.playlist_state.loop_start_ticks,
+                                self.playlist_state.loop_end_ticks,
+                                engine_handle.as_ref(),
+                            );
+                        }
+                        OpenLiveView::ArrangerView => {
+                            crate::views::arranger_view::show(
+                                ui,
+                                &mut self.live_tracks, // <--- Modificado a &mut para poder mover los sliders/knobs
+                                // &self.live_tracks,
+                                &self.matrix_state,
+                                &self.transport,
+                                &self.audio_proxy,
+                            );
+                        }
+                    }
                 }
                 AppMode::OpenStudio => {
-                    // ...
                     let mut current_bar = self.current_bar();
                     let transport_sample_count = self.transport.sample_count;
                     let beats_per_bar = self.transport.beats_per_bar;

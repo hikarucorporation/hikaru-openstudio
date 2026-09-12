@@ -42,7 +42,7 @@
 sudo apt update && sudo apt install -y build-essential pkg-config git libasound2-dev libx11-dev libgl1-mesa-dev
 
 # 2. Clonar y ejecutar
-git clone [https://github.com/hikarucorporation/hikaru-openstudio.git](https://github.com/hikarucorporation/hikaru-openstudio.git)
+git clone https://github.com/hikarucorporation/hikaru-openstudio.git
 cd hikaru-openstudio
 cargo run --release -p hikaru_gui
 

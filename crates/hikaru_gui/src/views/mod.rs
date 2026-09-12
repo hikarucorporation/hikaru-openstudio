@@ -7,5 +7,6 @@ pub mod open_wavetable;
 pub mod playlist;
 pub mod menu_bar;
 pub mod about; // <-- AGREGAR
+pub mod arranger_view;
 pub mod explorer;
 pub mod audio_settings;
