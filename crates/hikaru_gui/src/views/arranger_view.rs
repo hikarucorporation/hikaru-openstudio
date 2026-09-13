@@ -95,7 +95,7 @@ pub fn show(
 
                 ui.separator();
 
-                // 2. COLUMNA MASTER (Ahora al final, a la derecha)
+                // 2. COLUMNA MASTER (Scene Master Launchers)
                 ui.vertical(|ui| {
                     ui.set_width(track_width);
                     
@@ -106,11 +106,46 @@ pub fn show(
                         });
                     });
 
-                    // Espaciado para alinear con la parte inferior de los faders de audio
-                    let total_matrix_height = (scenes_count as f32 * (clip_slot_height + 1.0)) + 66.0;
-                    ui.add_space(total_matrix_height);
+                    ui.add_space(2.0);
+
+                    // Botones Master Scene Launchers (Misma estructura exacta que las audio tracks)
+                    for scene_idx in 0..scenes_count {
+                        let (slot_rect, response) = ui.allocate_exact_size(
+                            Vec2::new(track_width, clip_slot_height),
+                            Sense::click(),
+                        );
+
+                        if ui.is_rect_visible(slot_rect) {
+                            let painter = ui.painter();
+                            let fill_color = if response.hovered() {
+                                Color32::from_rgb(50, 50, 60)
+                            } else {
+                                Color32::from_rgb(30, 30, 40)
+                            };
+
+                            painter.rect_filled(slot_rect, 2.0, fill_color);
+                            painter.rect_stroke(
+                                slot_rect,
+                                2.0,
+                                Stroke::new(1.0_f32, Color32::from_rgb(0, 150, 190)),
+                            );
+
+                            painter.text(
+                                slot_rect.center(),
+                                Align2::CENTER_CENTER,
+                                format!("▶ Scene {}", scene_idx + 1),
+                                FontId::proportional(10.0),
+                                Color32::WHITE,
+                            );
+                        }
+
+                        ui.add_space(1.0);
+                    }
+
+                    ui.add_space(62.0);
                     ui.separator();
 
+                    // Controles inferiores Master
                     ui.vertical_centered(|ui| {
                         custom_pan_slider(ui, &mut master_track.pan);
                         ui.add_space(4.0);
