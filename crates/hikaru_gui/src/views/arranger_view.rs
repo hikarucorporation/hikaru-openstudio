@@ -2,12 +2,15 @@ use egui::*;
 use crate::views::mixer;
 use hikaru_transport::TransportPosition;
 use crate::audio_proxy::AudioProxy;
+// Importamos el estado y handlers de la Session Matrix
+use crate::views::matrix::{self, SessionMatrixState, SlotState};
 
 pub fn show(
     ui: &mut Ui,
     tracks: &mut [mixer::Track],
+    matrix_state: &mut SessionMatrixState, // <-- Recibimos el estado de la matriz
     _transport: &TransportPosition,
-    _audio_proxy: &AudioProxy,
+    audio_proxy: &AudioProxy,               // <-- Usado para emitir los GuiCommands
 ) {
     if tracks.is_empty() {
         return;
@@ -15,7 +18,7 @@ pub fn show(
 
     let track_width = 100.0;
     let clip_slot_height = 25.0;
-    let scenes_count = 8;
+    let scenes_count = matrix_state.scenes.len(); // Usamos la cantidad dinámica de escenas
 
     let (master_track, audio_tracks) = tracks.split_first_mut().unwrap();
 
@@ -23,7 +26,7 @@ pub fn show(
         .id_source("session_matrix_scroll")
         .show(ui, |ui| {
             ui.horizontal(|ui| {
-                // 1. COLUMNA ESCENAS / MASTER (Ahora a la izquierda)
+                // 1. COLUMNA ESCENAS / MASTER (Panel Izquierdo)
                 ui.vertical(|ui| {
                     ui.set_width(track_width);
                     
@@ -36,11 +39,17 @@ pub fn show(
 
                     ui.add_space(2.0);
 
+                    // Renderizado y disparo dinámico de Escenas
                     for scene_idx in 0..scenes_count {
                         let (slot_rect, response) = ui.allocate_exact_size(
                             Vec2::new(track_width, clip_slot_height),
                             Sense::click(),
                         );
+
+                        // ACCIÓN: Al hacer click en el disparador de escena de la izquierda
+                        if response.clicked() {
+                            matrix::trigger_scene(matrix_state, audio_proxy, scene_idx);
+                        }
 
                         if ui.is_rect_visible(slot_rect) {
                             let painter = ui.painter();
@@ -57,10 +66,14 @@ pub fn show(
                                 Stroke::new(1.0_f32, Color32::from_rgb(0, 150, 190)),
                             );
 
+                            let scene_name = matrix_state.scenes.get(scene_idx)
+                                .map(|s| s.name.as_str())
+                                .unwrap_or("Scene");
+
                             painter.text(
                                 slot_rect.center(),
                                 Align2::CENTER_CENTER,
-                                format!("▶ Scene {}", scene_idx + 1),
+                                format!("▶ {}", scene_name),
                                 FontId::proportional(10.0),
                                 Color32::WHITE,
                             );
@@ -86,7 +99,7 @@ pub fn show(
 
                 ui.separator();
 
-                // 2. MATRIZ DE PISTAS DE AUDIO
+                // 2. MATRIZ DE PISTAS DE AUDIO SINCRONIZADA CON MATRIX_STATE
                 for (i, track) in audio_tracks.iter_mut().enumerate() {
                     ui.vertical(|ui| {
                         ui.set_width(track_width);
@@ -106,27 +119,47 @@ pub fn show(
                                 Sense::click(),
                             );
 
+                            // ACCIÓN: Al hacer click en un Pad/Slot individual
+                            if response.clicked() && i < matrix_state.grid.len() {
+                                matrix_state.selected_slot = Some((i, scene_idx));
+                                matrix::trigger_pad(matrix_state, audio_proxy, i, scene_idx);
+                            }
+
                             if ui.is_rect_visible(slot_rect) {
                                 let painter = ui.painter();
-                                let fill_color = if response.hovered() {
-                                    Color32::from_rgb(35, 35, 35)
-                                } else {
-                                    Color32::from_rgb(25, 25, 25)
+                                
+                                // Lectura del estado real del Slot (Playing, Stopped, Empty, etc.)
+                                let slot_info = matrix_state.grid.get(i).and_then(|row| row.get(scene_idx));
+                                let (fill_color, border_color, text_label) = match slot_info {
+                                    Some(slot) => match &slot.state {
+                                        SlotState::Playing => (
+                                            Color32::from_rgb(35, 135, 60),
+                                            Color32::GREEN,
+                                            slot.clip.as_ref().map(|c| format!("▶ {}", c.name)).unwrap_or_else(|| "▶ Clip".into()),
+                                        ),
+                                        SlotState::Stopped => (
+                                            Color32::from_rgb(45, 55, 75),
+                                            Color32::from_rgb(90, 130, 190),
+                                            slot.clip.as_ref().map(|c| c.name.clone()).unwrap_or_else(|| "[ Slot ]".into()),
+                                        ),
+                                        _ => (
+                                            if response.hovered() { Color32::from_rgb(35, 35, 35) } else { Color32::from_rgb(25, 25, 25) },
+                                            Color32::from_gray(45),
+                                            format!("[ Scene {} ]", scene_idx + 1),
+                                        ),
+                                    },
+                                    None => (Color32::from_rgb(25, 25, 25), Color32::from_gray(45), "".into()),
                                 };
 
                                 painter.rect_filled(slot_rect, 2.0, fill_color);
-                                painter.rect_stroke(
-                                    slot_rect,
-                                    2.0,
-                                    Stroke::new(1.0_f32, Color32::from_gray(45)),
-                                );
+                                painter.rect_stroke(slot_rect, 2.0, Stroke::new(1.0_f32, border_color));
 
                                 painter.text(
                                     slot_rect.center(),
                                     Align2::CENTER_CENTER,
-                                    format!("[ Scene {} | Audio {} ]", scene_idx + 1, i + 1),
+                                    text_label,
                                     FontId::proportional(9.0),
-                                    Color32::DARK_GRAY,
+                                    Color32::WHITE,
                                 );
                             }
 

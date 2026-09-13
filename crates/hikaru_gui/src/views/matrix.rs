@@ -182,26 +182,80 @@ impl SessionMatrixState {
     }
 }
 
-/// Polling por frame de la Session Matrix contra el estado del engine.
-///
-/// Recorre los slots en `Playing` y los apaga (`Playing` → `Stopped`/`Idle`)
-/// en cuanto la voz está inactiva (`is_playing == false` o
-/// `VoiceState::Finished` == `VoiceStatus::Finished`).
-/// No envía ningún `GuiCommand`: solo muta el `SlotState` local para que la
-/// celda verde apague su brillo y el pad deje de considerarse disparado.
-/// Retorna cuántos slots se desactivaron en esta llamada.
-pub fn poll_finished_voices(
-    state: &mut SessionMatrixState,
-    is_voice_active: impl Fn(usize, usize) -> bool,
-) -> usize {
+pub(crate) fn trigger_pad(state: &mut SessionMatrixState, audio_proxy: &AudioProxy, track_idx: usize, scene_idx: usize) {
+    if state.grid[track_idx][scene_idx].clip.is_none() {
+        return;
+    }
+
+    let current_state = state.grid[track_idx][scene_idx].state.clone();
+
+    match current_state {
+        SlotState::Stopped => {
+            for s in 0..state.scenes.len() {
+                if s != scene_idx && state.grid[track_idx][s].state == SlotState::Playing {
+                    state.grid[track_idx][s].state = SlotState::Stopped;
+                }
+            }
+            state.grid[track_idx][scene_idx].state = SlotState::Playing;
+            if let Some(clip) = state.grid[track_idx][scene_idx].clip.as_mut() {
+                clip.local_bar = 1.0;
+            }
+
+            audio_proxy.send(GuiCommand::TriggerClip {
+                track_idx,
+                scene_idx,
+            });
+        }
+        SlotState::Playing => {
+            state.grid[track_idx][scene_idx].state = SlotState::Stopped;
+
+            audio_proxy.send(GuiCommand::TriggerClip {
+                track_idx,
+                scene_idx,
+            });
+        }
+        SlotState::QueuedToPlay | SlotState::QueuedToStop => {
+            state.grid[track_idx][scene_idx].state = SlotState::Stopped;
+            audio_proxy.send(GuiCommand::TriggerClip {
+                track_idx,
+                scene_idx,
+            });
+        }
+        _ => {}
+    }
+}
+
+pub(crate) fn trigger_scene(state: &mut SessionMatrixState, audio_proxy: &AudioProxy, scene_idx: usize) {
+    for track_idx in 0..state.tracks.len() {
+        if state.grid[track_idx][scene_idx].clip.is_some() {
+            for s in 0..state.scenes.len() {
+                if s != scene_idx && state.grid[track_idx][s].state == SlotState::Playing {
+                    state.grid[track_idx][s].state = SlotState::Stopped;
+                }
+            }
+            state.grid[track_idx][scene_idx].state = SlotState::Playing;
+            if let Some(clip) = state.grid[track_idx][scene_idx].clip.as_mut() {
+                clip.local_bar = 1.0;
+            }
+        }
+    }
+
+    audio_proxy.send(GuiCommand::TriggerScene { scene_idx });
+}
+
+/// Recorre los slots reproduciéndose y apaga el estado si la voz fue finalizada.
+pub fn poll_finished_voices<F>(state: &mut SessionMatrixState, is_active: F) -> usize 
+where
+    F: Fn(usize, usize) -> bool,
+{
     let mut deactivated = 0;
-    for track_idx in 0..state.grid.len() {
-        for scene_idx in 0..state.grid[track_idx].len() {
-            if state.grid[track_idx][scene_idx].state == SlotState::Playing
-                && !is_voice_active(track_idx, scene_idx)
-            {
-                state.grid[track_idx][scene_idx].state = SlotState::Stopped;
-                deactivated += 1;
+    for track_idx in 0..state.tracks.len() {
+        for scene_idx in 0..state.scenes.len() {
+            if state.grid[track_idx][scene_idx].state == SlotState::Playing {
+                if !is_active(track_idx, scene_idx) {
+                    state.grid[track_idx][scene_idx].state = SlotState::Stopped;
+                    deactivated += 1;
+                }
             }
         }
     }
@@ -210,8 +264,7 @@ pub fn poll_finished_voices(
 
 /// Polling directo contra el `AudioEngine`: lee las voces inactivas del
 /// engine sobre el reloj LINEAL (`voice_active`, sin wrap del loop global)
-/// y apaga los slots correspondientes. El Time Selection mueve el cursor
-/// pero jamás re-emite una voz: agotada su emisión lineal, el pad se apaga.
+/// y apaga los slots correspondientes.
 pub fn poll_engine_slots(state: &mut SessionMatrixState, engine: &AudioEngine) -> usize {
     poll_finished_voices(state, |track_idx, scene_idx| {
         engine.voice_active(track_idx, scene_idx)
@@ -233,20 +286,18 @@ pub fn show(
     global_loop_end_ticks: u64,
     engine_handle: Option<&Arc<Mutex<AudioEngine<'static>>>>,
 ) {
-    // 1. Polling del estado del engine por frame: si una voz terminó
-    // (Finished / is_playing == false), el pad pasa a Idle/Stopped de
-    // inmediato, deja de considerarse disparado y la celda verde apaga el
-    // brillo. `try_lock` para no bloquear el callback de audio.
     if let Some(handle) = engine_handle {
         if let Ok(engine) = handle.try_lock() {
             let deactivated = poll_engine_slots(state, &engine);
             if deactivated > 0 {
                 ui.ctx().request_repaint();
             }
+        } else {
+            ui.ctx().request_repaint();
         }
     }
     ui.horizontal(|ui| {
-        ui.heading("SESSION MATRIX"); // LOCO, no cambiés esto por nada en el mundo[cite: 11]
+        ui.heading("SESSION MATRIX"); // LOCO, no cambiés esto por nada en el mundo
         ui.add_space(20.0);
 
         ui.group(|ui| {
@@ -274,7 +325,6 @@ pub fn show(
         });
     });
 
-    // Si hay algún clip sonando en la matriz, mantener la UI actualizando
     let any_clip_playing = state.grid.iter().flatten()
         .any(|slot| slot.state == SlotState::Playing);
     if any_clip_playing {
@@ -547,11 +597,6 @@ fn render_clip_editor_track_view(
     _global_loop_end_ticks: u64,
     engine_handle: Option<&Arc<Mutex<AudioEngine<'static>>>>,
 ) {
-    // Override del playhead con el elapsed LINEAL de la voz
-    // (`absolute_frame - start_absolute`): 0 al disparar → tick 0 → aguja
-    // EXACTA sobre la línea del compás 1 cuando el transporte resetea a
-    // bar 1, frame 0. El cursor global (con wrap del Time Selection) solo
-    // se usa como fallback sin voz activa. `try_lock` para no bloquear audio.
     let playhead_override_ticks: Option<u64> = (|| {
         let (track_idx, scene_idx) = state.selected_slot?;
         let handle = engine_handle?;
@@ -567,9 +612,7 @@ fn render_clip_editor_track_view(
         }
         Some(((elapsed as f64 / sr) / seconds_per_tick).round() as u64)
     })();
-    // Espejo en `local_bar` (1-based) para cualquier otro lector: con voz
-    // activa deriva de la voz, si no lo deja como está (show_impl lo
-    // sincroniza al cursor global como fallback).
+
     if let (Some(tick), Some((track_idx, scene_idx))) =
         (playhead_override_ticks, state.selected_slot)
     {
@@ -583,7 +626,6 @@ fn render_clip_editor_track_view(
                     let ticks_per_bar = ppqn.max(1) as f64 * 4.0;
                     clip.local_bar = (tick as f64 / ticks_per_bar) as f32 + 1.0;
                 }
-                // Voz viva: redibujo continuo para que la aguja avance.
                 ui.ctx().request_repaint();
             }
         }
@@ -627,10 +669,6 @@ fn render_clip_editor_track_view(
             let clip = state.grid[track_idx][scene_idx].clip.as_mut().unwrap();
             let mut local_tracks = vec![clip.local_track.clone()];
 
-            // Mismo handler de dibujado y selección de rango con Shift+Drag
-            // que el Arranger: la regla del Clip Track Editor define el loop
-            // individual del clip seleccionado. La aguja deriva del elapsed
-            // de la voz (override) cuando hay voz activa; si no, del cursor.
             playlist::show_embedded(
                 ui,
                 &mut clip.local_state,
@@ -650,27 +688,17 @@ fn render_clip_editor_track_view(
                 clip.local_track = updated_track;
             }
 
-            // El loopeo visual de la regla determina los puntos de loop del
-            // clip actual (`clip.loop_start` / `clip.loop_end`), permitiendo
-            // que el clip individual loopee de forma independiente al
-            // transporte global.
-            // Los límites se envían al engine ÚNICAMENTE al terminar el
-            // arrastre (`drag_stopped`, vía
-            // `loop_drag_completed_this_frame`), nunca en cada frame de
-            // renderizado GUI (evita SetClipLoop continuo).
-            {
-                // Solo propagar al engine cuando terminó el drag.
-                if clip.local_state.loop_drag_completed_this_frame {
-                    let ppqn = clip.local_state.ppqn.max(1) as f64;
-                    let (new_start, new_end, new_enabled) = if clip.local_state.is_loop_region_valid() {
-                        (
-                            clip.local_state.loop_start_ticks,
-                            clip.local_state.loop_end_ticks,
-                            true,
-                        )
-                    } else {
-                        (clip.loop_start, clip.loop_end, false)
-                    };
+            if clip.local_state.loop_drag_completed_this_frame {
+                let ppqn = clip.local_state.ppqn.max(1) as f64;
+                let (new_start, new_end, new_enabled) = if clip.local_state.is_loop_region_valid() {
+                    (
+                        clip.local_state.loop_start_ticks,
+                        clip.local_state.loop_end_ticks,
+                        true,
+                    )
+                } else {
+                    (clip.loop_start, clip.loop_end, false)
+                };
 
                 if new_start != clip.loop_start
                     || new_end != clip.loop_end
@@ -681,10 +709,11 @@ fn render_clip_editor_track_view(
                     clip.loop_enabled = new_enabled;
 
                     let seconds_per_tick = if bpm > 0.0 {
-                        (60.0 / bpm) / ppqn
+                        (60.0_f64 / bpm) / ppqn
                     } else {
-                        0.0
+                        0.0_f64
                     };
+
                     audio_proxy.send(GuiCommand::SetClipLoop {
                         track_idx,
                         scene_idx,
@@ -692,7 +721,6 @@ fn render_clip_editor_track_view(
                         loop_end_secs: (new_end as f64 * seconds_per_tick) as f32,
                         enabled: new_enabled,
                     });
-                }
                 }
             }
         });
@@ -732,9 +760,7 @@ fn load_clip_into_slot(
         Color32::from_rgb(32, 95, 145),
     );
     local_state.clips.push((0, initial_sub_clip));
-    // Reset estricto de `sample_offset` al cargar: el clip nuevo arranca en
-    // 0 salvo trim manual posterior del usuario (manija izquierda). Ningún
-    // offset del cursor global se aplica al inicio del clip.
+
     for (_, sub) in local_state.clips.iter_mut() {
         if let playlist::ClipType::Audio { sample_offset_ticks, .. } = &mut sub.clip_type {
             *sample_offset_ticks = 0;
@@ -768,74 +794,6 @@ fn load_clip_into_slot(
     });
 }
 
-fn trigger_pad(state: &mut SessionMatrixState, audio_proxy: &AudioProxy, track_idx: usize, scene_idx: usize) {
-    if state.grid[track_idx][scene_idx].clip.is_none() {
-        return;
-    }
-
-    let current_state = state.grid[track_idx][scene_idx].state.clone();
-
-    match current_state {
-        SlotState::Stopped => {
-            // Apagamos visualmente cualquier otro clip que estuviera sonando EN LA MISMA PISTA
-            for s in 0..state.scenes.len() {
-                if s != scene_idx && state.grid[track_idx][s].state == SlotState::Playing {
-                    state.grid[track_idx][s].state = SlotState::Stopped;
-                }
-            }
-            state.grid[track_idx][scene_idx].state = SlotState::Playing;
-            // Snap de la aguja al compás 1 en el disparo: el trim manual
-            // (`sample_offset_ticks`) se preserva, ningún offset del cursor
-            // global se aplica al inicio de la voz (el engine arranca en 0).
-            if let Some(clip) = state.grid[track_idx][scene_idx].clip.as_mut() {
-                clip.local_bar = 1.0;
-            }
-
-            // ÚNICAMENTE disparamos el evento de este pad
-            audio_proxy.send(GuiCommand::TriggerClip {
-                track_idx,
-                scene_idx,
-            });
-        }
-        SlotState::Playing => {
-            state.grid[track_idx][scene_idx].state = SlotState::Stopped;
-
-            // Al volver a tocarlo, enviamos la orden para detener ese pad puntual
-            audio_proxy.send(GuiCommand::TriggerClip {
-                track_idx,
-                scene_idx,
-            });
-        }
-        _ => {}
-    }
-}
-
-fn trigger_scene(state: &mut SessionMatrixState, audio_proxy: &AudioProxy, scene_idx: usize) {
-    // EVENTO DISCRETO: un solo `TriggerScene` por click. Antes se enviaban
-    // N `TriggerClip` (toggle) + 1 `TriggerScene` (set), lo que reiniciaba
-    // cada voz dos veces en el mismo sample y extendía la ventana de
-    // emisión. El engine (`trigger_scene`) resuelve la exclusiva por pista;
-    // la GUI solo actualiza el estado visual local.
-    for track_idx in 0..state.tracks.len() {
-        if state.grid[track_idx][scene_idx].clip.is_some() {
-            // Detenemos los otros clips de las pistas correspondientes y marcamos como playing
-            for s in 0..state.scenes.len() {
-                if s != scene_idx && state.grid[track_idx][s].state == SlotState::Playing {
-                    state.grid[track_idx][s].state = SlotState::Stopped;
-                }
-            }
-            state.grid[track_idx][scene_idx].state = SlotState::Playing;
-            // Snap de cada aguja al compás 1 (trim manual preservado).
-            if let Some(clip) = state.grid[track_idx][scene_idx].clip.as_mut() {
-                clip.local_bar = 1.0;
-            }
-        }
-    }
-
-    // Enviamos el disparo masivo de la escena sin forzar Seek/Play global
-    audio_proxy.send(GuiCommand::TriggerScene { scene_idx });
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -853,10 +811,8 @@ mod tests {
     #[test]
     fn finished_voice_turns_pad_idle() {
         let mut s = playing_state();
-        // Voz terminada → Idle/Stopped de inmediato.
         assert_eq!(poll_finished_voices(&mut s, |_, _| false), 1);
         assert_eq!(s.grid[0][0].state, SlotState::Stopped);
-        // Idempotente: ya apagado no vuelve a contar.
         assert_eq!(poll_finished_voices(&mut s, |_, _| false), 0);
     }
 
@@ -869,24 +825,18 @@ mod tests {
 
     #[test]
     fn engine_voice_finished_at_bar5_turns_pad_off() {
-        // Compás 5 == pasado el final de un clip de 4 compases sin loop:
-        // el verde se apaga solo vía poll_engine_slots.
         let clock = Arc::new(AtomicU64::new(0));
         let mut engine =
             AudioEngine::new(SampleRate::new(44100.0), &TABLE, clock);
         engine.set_mode(hikaru_audio_engine::EngineMode::OpenLive);
-        // 1000 frames de audio real, disparo en t=0.
         engine.add_clip(1, 0, 0, vec![0.5; 1000 * 2], 0.0, 0.0, 0.0, 2, true, engine.sample_rate);
         engine.trigger_clip(0, 0);
         assert!(engine.clips[0].is_playing);
 
         let mut s = playing_state();
-        // Dentro del clip (frame lineal 999): sigue verde.
         engine.absolute_frame = 999;
         assert_eq!(poll_engine_slots(&mut s, &engine), 0);
         assert_eq!(s.grid[0][0].state, SlotState::Playing);
-        // Compás 5 / past-end (frame lineal 1000+): Finished → Stopped,
-        // aunque el cursor siga loopeando en el Time Selection.
         engine.absolute_frame = 5000;
         assert_eq!(poll_engine_slots(&mut s, &engine), 1);
         assert_eq!(s.grid[0][0].state, SlotState::Stopped);
@@ -899,7 +849,6 @@ mod tests {
             AudioEngine::new(SampleRate::new(44100.0), &TABLE, clock);
         engine.set_mode(hikaru_audio_engine::EngineMode::OpenLive);
         engine.add_clip(1, 0, 0, vec![0.5; 1000 * 2], 0.0, 0.0, 0.0, 2, true, engine.sample_rate);
-        // Sin trigger: is_playing == false → el pad Playing se apaga.
         let mut s = playing_state();
         assert_eq!(poll_engine_slots(&mut s, &engine), 1);
         assert_eq!(s.grid[0][0].state, SlotState::Stopped);

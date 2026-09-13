@@ -567,6 +567,7 @@ impl eframe::App for HikaruApp {
                             crate::views::arranger_view::show(
                                 ui,
                                 &mut self.live_tracks,
+                                &mut self.matrix_state, // <-- Agregar el argumento faltante
                                 &self.transport,
                                 &self.audio_proxy,
                             );
