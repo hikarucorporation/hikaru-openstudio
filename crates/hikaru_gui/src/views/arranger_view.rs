@@ -165,7 +165,7 @@ pub fn show(
             // 3. MEZCLADOR / FADERS AL PIE DE CADA COLUMNA
             // -------------------------------------------------------------
             ui.horizontal(|ui| {
-                ui.allocate_ui(vec2(scene_label_width, 220.0), |ui| {
+                ui.allocate_ui(vec2(scene_label_width, 360.0), |ui| {
                     ui.vertical_centered(|ui| {
                         // ui.label(RichText::new("MASTER").small());
                         custom_pan_slider(ui, &mut master_track.pan);
@@ -182,7 +182,7 @@ pub fn show(
                 ui.separator();
 
                 for track in audio_tracks.iter_mut() {
-                    ui.allocate_ui(vec2(track_width, 220.0), |ui| {
+                    ui.allocate_ui(vec2(track_width, 360.0), |ui| {
                         ui.vertical_centered(|ui| {
                             custom_pan_slider(ui, &mut track.pan);
                             ui.add_space(4.0);
@@ -267,7 +267,8 @@ fn custom_pan_slider(ui: &mut Ui, pan_val: &mut f32) -> Response {
 
 // Helper: Custom Volume Vertical Fader
 fn custom_volume_fader(ui: &mut Ui, volume_val: &mut f32) -> Response {
-    let desired_size = vec2(30.0, 140.0);
+    // Cambiá 140.0 por 280.0 (o el alto que prefieras)
+    let desired_size = vec2(30.0, 180.0);
     let (rect, response) = ui.allocate_at_least(desired_size, Sense::drag());
 
     let thumb_width = 45.0;
