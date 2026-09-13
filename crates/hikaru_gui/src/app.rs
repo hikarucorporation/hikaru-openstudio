@@ -55,19 +55,10 @@ fn sync_matrix_mixer_bidirectional(
     }
 
     // 3. Sincronizar parámetros por track (matrix ↔ mixer → engine)
-    //
-    // IMPORTANT: The Session Matrix stores clips at 0-based track indices
-    // (`LoadClip { track_index: track_idx }` where `track_idx` is the grid
-    // row). The AudioEngine indexes clips by this same `track_index`.
-    // Therefore all engine parameter commands (volume, pan, mute, solo)
-    // MUST use the 0-based matrix index `i`, NOT `mixer_idx` (= i + 1).
-    // Using `mixer_idx` would target the WRONG engine track, causing
-    // secondary tracks to play uncontrolled (chopped/desynced audio).
     for i in 0..matrix_len {
         let mixer_idx = i + 1;
         if mixer_idx >= live_tracks.len() { break; }
 
-        // Leer valores de la matrix en variables locales (evita borrow overlap)
         let (mx_name, mx_vol, mx_pan, mx_muted, mx_soloed) = {
             let mx = &matrix_state.tracks[i];
             (mx.name.clone(), mx.volume, mx.pan, mx.muted, mx.soloed)
@@ -171,17 +162,10 @@ pub struct HikaruApp {
     pub mode: AppMode,
     pub transport: TransportPosition,
     pub position_clock: Arc<AtomicU64>,
-    /// Pico real de salida del engine (bits de f32, 0.0 == -inf dB).
-    /// El vúmetro del mixer lee ESTO, no el fader: en compases sin audio
-    /// marca -inf aunque el fader siga alto.
     pub output_level_bits: Arc<AtomicU32>,
     pub is_looping: bool,
     pub cpu_usage: f32,
-    /// Último BPM propagado al motor vía `GuiCommand::SetBpm`.
-    /// Evita spamear al engine cada frame: solo se envía al cambiar.
     bpm_synced_to_engine: f64,
-    /// Último loop global propagado al motor vía `SetGlobalLoop`.
-    /// Evita spamear al engine cada frame: solo se envía al cambiar.
     global_loop_synced_to_engine: Option<(bool, u64, u64)>,
     pub show_mixer: bool,
     pub show_dsp_rack: bool,
@@ -193,6 +177,7 @@ pub struct HikaruApp {
     pub audio_settings_state: audio_settings::AudioSettingsState,
     pub playlist_state: playlist::PlaylistState,
     pub matrix_state: matrix::SessionMatrixState,
+    pub matrix_clipboard: matrix::MatrixClipboard,
     pub dragged_sample: Option<PathBuf>,
 
     pub live_tracks: Vec<mixer::Track>,
@@ -204,19 +189,12 @@ pub struct HikaruApp {
 
     pub audio_proxy: AudioProxy,
     pub _audio_stream: Option<cpal::Stream>,
-    /// Handle compartido al engine para el polling por frame de la Session
-    /// Matrix (`Playing` → `Stopped` cuando la voz termina). Se lee con
-    /// `try_lock` para no bloquear el callback de audio.
     pub engine_handle: Option<Arc<Mutex<AudioEngine<'static>>>>,
-    /// Peaks por pista: clones de los `Arc<AtomicU32>` del engine.
-    /// El mixer lee estos valores para los VU meters individuales.
     pub track_peak_bits: Vec<Arc<AtomicU32>>,
-    /// Smoothed peaks (GUI-side lerp) para VU meters sin flicker.
-    /// Fórmula: `smoothed = smoothed * 0.85 + raw * 0.15` por frame.
     pub smoothed_track_peaks: [f32; 16],
     pub smoothed_master_peak: f32,
 
-    pub openlive_view: OpenLiveView, // Subvista activa dentro de OpenLive
+    pub openlive_view: OpenLiveView,
 }
 
 impl HikaruApp {
@@ -235,7 +213,6 @@ impl HikaruApp {
             mixer::Track::new(0, "MASTER".to_string(), true),
         ];
         let mut matrix_state = matrix::SessionMatrixState::default();
-        // Sync inicial: crear tracks del mixer desde la matrix
         {
             let empty_old: Vec<matrix::TrackMeta> = Vec::new();
             let empty_mixer_old: Vec<(f32, f32, bool, bool)> = Vec::new();
@@ -255,7 +232,6 @@ impl HikaruApp {
             t.volume = 0.70;
         }
 
-        // Extraer clones de los Arc<AtomicU32> de peaks por pista del engine.
         let track_peak_bits_init: Vec<Arc<AtomicU32>> = if let Some(ref handle) = engine_handle {
             if let Ok(engine) = handle.try_lock() {
                 engine.track_peak_bits.iter().map(|a| Arc::clone(a)).collect()
@@ -287,6 +263,7 @@ impl HikaruApp {
 
             playlist_state: playlist::PlaylistState::default(),
             matrix_state,
+            matrix_clipboard: matrix::MatrixClipboard::default(),
 
             live_tracks,
             studio_tracks,
@@ -294,10 +271,6 @@ impl HikaruApp {
             selected_track_index: 1,
             selected_slot_index: 0,
             fonts_configured: false,
-            // FUGA #2 (BPM): arrancar en valor imposible (-1.0) para forzar
-            // el primer `SetBpm` al engine en el primer frame. Con 140.0
-            // inicial nunca se sincronizaba (engine arranca en 128.0) y el
-            // cursor corría a un tempo y el audio a otro.
             bpm_synced_to_engine: -1.0,
             global_loop_synced_to_engine: None,
             audio_proxy,
@@ -310,9 +283,6 @@ impl HikaruApp {
         }
     }
 
-    /// Sincroniza el Sample Rate real del hardware con el transporte GUI.
-    /// Debe llamarse tras `init_cpal_stream` (p. ej. 48000 Hz): sin esto la
-    /// GUI seguiría calculando con 44100 y el cursor correría desincronizado.
     pub fn sync_hardware_sample_rate(&mut self, hardware_sr: f32) {
         if hardware_sr > 0.0 {
             self.transport.sample_rate = SampleRate::new(hardware_sr);
@@ -320,8 +290,6 @@ impl HikaruApp {
     }
 
     pub fn current_bar(&self) -> f32 {
-        // Bar 1-based con BPM activo + SR real + beats_per_bar del transporte.
-        // Cálculo en f64 (el f32 solo al final para la UI).
         let samples_per_bar = self.transport.samples_per_bar();
         if samples_per_bar <= 0.0 {
             return 1.0;
@@ -329,8 +297,6 @@ impl HikaruApp {
         (1.0 + self.transport.sample_count as f64 / samples_per_bar) as f32
     }
 
-    /// Playhead exacto en ticks con el PPQN único del motor.
-    /// Inversa exacta del tiempo real del audio: no pasa por `f32`.
     pub fn current_tick(&self) -> u64 {
         self.transport
             .samples_to_ticks(self.transport.sample_count)
@@ -344,34 +310,15 @@ impl eframe::App for HikaruApp {
             self.fonts_configured = true;
         }
 
-        // --- LÓGICA DE TRANSPORTE Y REPRODUCCIÓN EN TIEMPO REAL ---
-        // Siempre sincronizar el reloj del engine para que la posición esté
-        // actualizada tanto en OpenStudio como en OpenLive (clips individuales).
         self.transport.sample_count = self.position_clock.load(Ordering::Relaxed);
-
-        // PPQN único: la playlist nunca diverge del motor.
-        // `transport.ppqn()` == `DEFAULT_PPQN` es la única fuente de verdad.
         self.playlist_state.ppqn = self.transport.ppqn();
 
-        // BPM dinámico: si el header cambió el BPM de la GUI, propagarlo al
-        // motor UNA vez (no cada frame) para que audio y cursor usen el mismo
-        // tempo. Sin esto el cursor corre a un tempo y el audio a otro.
-        // FUGA #2: el envío es sincrónico al cambio (antes del loop global,
-        // que deriva `ticks_to_samples` del mismo BPM), así `clip_length`
-        // en frames del engine coincide con los compases visuales.
-        // Ej.: clip a 135 BPM vs proyecto a 120 BPM -> la duración en
-        // frames se calcula con el tempo REAL del transporte
-        // (`ticks_to_samples`), no con un tempo rancio del engine.
         if (self.transport.bpm - self.bpm_synced_to_engine).abs() > f64::EPSILON {
             self.bpm_synced_to_engine = self.transport.bpm;
             self.audio_proxy
                 .send(GuiCommand::SetBpm(self.transport.bpm as f32));
         }
 
-        // FUGA #1 (espejo GUI): si el transporte global está en Playing el
-        // preview del explorer ya fue detenido en el engine (`play()->stop()`
-        // + gate en `process()`). Apagar también el flag visual para que la
-        // waveform no siga animando el playhead sobre el Master Mixer.
         if self.transport.playback_state == TransportPlaybackState::Playing
             && self.explorer_state.is_playing_preview
         {
@@ -380,20 +327,6 @@ impl eframe::App for HikaruApp {
         }
 
         if self.transport.playback_state == TransportPlaybackState::Playing {
-            // Loop global: el ENGINE es el dueño único del wrap
-            // (sample-accurate en `AudioEngine::process`, frame a frame).
-            // La GUI solo configura la región y la envía UNA vez por cambio
-            // vía `SetGlobalLoop`; nunca reescribe `sample_count` ni manda
-            // `Seek` para loopear. El cursor sigue al engine vía
-            // `position_clock`, así `loop_end_ticks` de la barra coincide
-            // exactamente con el wrap del motor.
-            //
-            // OpenStudio: sin región válida se auto-selecciona
-            // 0..fin_proyecto (mínimo 1 compás), estilo REAPER.
-            // OpenLive: la playlist está vacía y NO debe inventarse un loop
-            // de 1 compás (ese era el "reset en el compás 2"): solo hay loop
-            // global si la región es explícita y válida; si no, se propaga
-            // desactivado al engine y los clips loopean su duración real.
             let is_live = self.mode == AppMode::OpenLive;
             if self.is_looping && !is_live {
                 let ppqn = self.playlist_state.ppqn.max(1);
@@ -404,19 +337,16 @@ impl eframe::App for HikaruApp {
                     || end <= start
                     || len < ppqn
                 {
-                    // Sin selección válida: estilo REAPER, 0..fin_proyecto.
                     let total = self.playlist_state.total_project_ticks();
                     start = 0u64;
                     end = total.max(4u64.saturating_mul(ppqn));
                 }
-                // Verifica el rango en ticks antes de enviar.
                 if end <= start {
                     end = start.saturating_add(4u64.saturating_mul(ppqn));
                 }
                 if end.saturating_sub(start) < ppqn {
                     end = start.saturating_add(ppqn);
                 }
-                // SOLO confirma en la GUI si la región es válida.
                 if end > start {
                     self.playlist_state.loop_start_ticks = start;
                     self.playlist_state.loop_end_ticks = end;
@@ -428,9 +358,6 @@ impl eframe::App for HikaruApp {
             ctx.request_repaint();
         }
 
-        // Sincronización del loop global GUI -> engine (una vez por cambio).
-        // Corre siempre (sonando o no) para que activar/desactivar 🔁 se
-        // propague sin esperar al play.
         {
             let ppqn = self.playlist_state.ppqn.max(1);
             let (want_enabled, want_start, want_end) =
@@ -452,7 +379,6 @@ impl eframe::App for HikaruApp {
             let want = (want_enabled, want_start_samples, want_end_samples);
             if self.global_loop_synced_to_engine != Some(want) {
                 self.global_loop_synced_to_engine = Some(want);
-                // Espejo local para que la GUI lea lo mismo que el engine.
                 self.transport
                     .set_loop_region_samples(want_start_samples, want_end_samples);
                 self.transport.set_loop_enabled(want_enabled);
@@ -464,7 +390,6 @@ impl eframe::App for HikaruApp {
             }
         }
 
-        // En OpenLive, pedir repaint continuo si hay clips disparados en la matriz
         if self.mode == AppMode::OpenLive {
             let any_clip_playing = self.matrix_state.grid.iter().flatten()
                 .any(|slot| slot.state == matrix::SlotState::Playing);
@@ -474,7 +399,6 @@ impl eframe::App for HikaruApp {
         }
 
         ctx.input(|i| {
-            // Manejo del Tab según el modo activo
             if i.key_pressed(egui::Key::Tab) {
                 match self.mode {
                     AppMode::OpenLive => {
@@ -530,36 +454,28 @@ impl eframe::App for HikaruApp {
         });
 
         CentralPanel::default().show(ctx, |ui| {
-            // Clon barato del handle (Arc) para el polling por frame sin
-            // pelear borrows con `matrix_state` dentro del closure.
             let engine_handle = self.engine_handle.clone();
             match self.mode {
                 AppMode::OpenLive => {
                     match self.openlive_view {
                         OpenLiveView::SessionMatrix => {
-                            // Tick exacto con PPQN único + BPM activo + SR real.
-                            // Sin hardcodear 960 ni fórmulas manuales divergentes.
                             let ppqn = self.transport.ppqn();
                             let current_tick = self.current_tick();
 
                             matrix::show(
                                 ui,
                                 &mut self.matrix_state,
+                                &mut self.matrix_clipboard,
                                 &mut self.dragged_sample,
                                 &self.audio_proxy,
-                                current_tick,
                                 ppqn,
-                                self.transport.bpm,          // <--- Arg 7: f64
-                                self.transport.sample_rate.get() as u32, // <--- O .to_u32() / .0 dependiendo del enum
+                                current_tick,
+                                self.transport.bpm,
+                                self.transport.sample_rate.get() as u32,
                                 self.transport.sample_count,
-                                // Loop global: la Session Matrix respeta la misma
-                                // región `[loop_start_ticks, loop_end_ticks]` y la
-                                // bandera `is_looping` (`loop_enabled`) que la
-                                // Playlist; el wrap se aplica en el bloque de
-                                // transporte (arriba) y en el display de matrix.rs.
                                 self.is_looping,
-                                self.playlist_state.loop_start_ticks,
                                 self.playlist_state.loop_end_ticks,
+                                self.playlist_state.loop_start_ticks,
                                 engine_handle.as_ref(),
                             );
                         }
@@ -567,9 +483,12 @@ impl eframe::App for HikaruApp {
                             crate::views::arranger_view::show(
                                 ui,
                                 &mut self.live_tracks,
-                                &mut self.matrix_state, // <-- Agregar el argumento faltante
+                                &mut self.matrix_state,
+                                &mut self.matrix_clipboard,
                                 &self.transport,
                                 &self.audio_proxy,
+                                &mut self.dragged_sample,
+                                self.transport.bpm,
                             );
                         }
                     }
@@ -578,10 +497,6 @@ impl eframe::App for HikaruApp {
                     let mut current_bar = self.current_bar();
                     let transport_sample_count = self.transport.sample_count;
                     let beats_per_bar = self.transport.beats_per_bar;
-                    // REAPER: pasar el estado del botón (`is_looping`), no el
-                    // `transport.loop_enabled` ya saneado (que es false cuando
-                    // aún no hay región). Así `ensure_minimum_global_loop`
-                    // puede auto-seleccionar 0..fin_proyecto al activar el loop.
                     playlist::show(
                         ui,
                         &mut self.playlist_state,
@@ -637,33 +552,26 @@ impl eframe::App for HikaruApp {
         });
 
         if self.show_mixer {
-            // Nivel real del engine: 0.0 en silencio == -inf dB.
             let raw_master =
                 f32::from_bits(self.output_level_bits.load(Ordering::Relaxed));
             let raw_master = if raw_master.is_finite() { raw_master } else { 0.0 };
-            // GUI-side lerp: suavizar para VU meter sin flicker.
             self.smoothed_master_peak = self.smoothed_master_peak * 0.85 + raw_master * 0.15;
             let output_level = self.smoothed_master_peak;
 
-            // Leer peaks por pista desde los Arc<AtomicU32> del engine.
             let mut track_peaks = [0.0f32; 16];
             for (i, arc) in self.track_peak_bits.iter().enumerate().take(16) {
                 let raw = f32::from_bits(arc.load(Ordering::Relaxed));
                 let raw = if raw.is_finite() { raw } else { 0.0 };
-                // GUI-side lerp por pista.
                 self.smoothed_track_peaks[i] = self.smoothed_track_peaks[i] * 0.85 + raw * 0.15;
                 track_peaks[i] = self.smoothed_track_peaks[i];
             }
 
-            // SYNC PRE-MIXER: capturar estado viejo de la matrix
             let old_matrix: Vec<matrix::TrackMeta> = if self.mode == AppMode::OpenLive {
                 self.matrix_state.tracks.clone()
             } else {
                 Vec::new()
             };
 
-            // Capturar estado viejo del mixer ANTES del render
-            // (del track list ACTIVO según el modo: live o studio).
             let old_live: Vec<(f32, f32, bool, bool)> = {
                 let active = match self.mode {
                     AppMode::OpenLive => &self.live_tracks,
@@ -691,11 +599,6 @@ impl eframe::App for HikaruApp {
                 },
             );
 
-            // SYNC POST-MIXER: sincronización bidireccional Matrix ↔ Mixer → Engine
-            // Master fader: el track 0 del mixer controla la ganancia master
-            // del engine. Su valor NO se sincroniza con la matrix (el master
-            // no tiene track en la matrix), solo se envía al engine cuando
-            // el fader cambia.
             {
                 let active = match self.mode {
                     AppMode::OpenLive => &self.live_tracks,
@@ -784,7 +687,6 @@ impl eframe::App for HikaruApp {
             }
         }
 
-        // --- VENTANA ABOUT ---
         if self.show_about {
             let about_title = match self.mode {
                 AppMode::OpenLive => "About Hikaru OpenLive",
@@ -809,7 +711,6 @@ impl eframe::App for HikaruApp {
             );
         }
 
-        // --- VENTANA AUDIO SETUP (SETTINGS) ---
         if self.audio_settings_state.is_open {
             ctx.show_viewport_immediate(
                 ViewportId::from_hash_of("hikaru_audio_settings_viewport"),

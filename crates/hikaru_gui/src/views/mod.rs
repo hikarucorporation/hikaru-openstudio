@@ -10,3 +10,6 @@ pub mod about; // <-- AGREGAR
 pub mod arranger_view;
 pub mod explorer;
 pub mod audio_settings;
+pub mod clipboard;
+pub mod waveform;
+pub mod clip_editor;

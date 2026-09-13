@@ -3,6 +3,8 @@
 // Bitwig-style Clip Launcher (OpenLive Dynamic Matrix)
 // crates/hikaru_gui/src/views/matrix.rs
 
+use crate::views::clip_editor;
+
 use egui::{
     Align2, Button, Color32, CursorIcon, Grid, Frame, RichText, ScrollArea, Sense, Stroke, Ui, Vec2
 };
@@ -10,6 +12,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use hikaru_audio_engine::AudioEngine;
 use crate::audio_proxy::{AudioProxy, GuiCommand};
+pub use crate::views::clipboard::MatrixClipboard;
 use crate::views::mixer::Track;
 use crate::views::playlist::{self, PlaylistState};
 
@@ -180,6 +183,76 @@ impl SessionMatrixState {
             }
         }
     }
+
+    pub fn copy_slot(&self, track_idx: usize, scene_idx: usize, clipboard: &mut MatrixClipboard) {
+        if let Some(slot) = self.grid.get(track_idx).and_then(|r| r.get(scene_idx)) {
+            clipboard.copy(slot);
+        }
+    }
+
+    pub fn cut_slot(&mut self, track_idx: usize, scene_idx: usize, clipboard: &mut MatrixClipboard, audio_proxy: &AudioProxy) {
+        self.copy_slot(track_idx, scene_idx, clipboard);
+        self.delete_slot(track_idx, scene_idx, audio_proxy);
+    }
+
+    pub fn paste_slot(&mut self, track_idx: usize, scene_idx: usize, clipboard: &MatrixClipboard, audio_proxy: &AudioProxy) {
+        if let Some(copied) = &clipboard.copied_slot {
+            let mut target_slot = copied.clone();
+            target_slot.state = SlotState::Stopped;
+
+            let next_id = self.next_clip_id;
+            self.next_clip_id += 1;
+
+            if let Some(clip) = target_slot.clip.as_mut() {
+                clip.id = next_id;
+                
+                let path_str = clip.path.to_string_lossy().to_string();
+                audio_proxy.send(GuiCommand::LoadClip {
+                    clip_id: next_id,
+                    path: path_str,
+                    position_secs: 0.0,
+                    duration_secs: 0.0,
+                    offset_secs: 0.0,
+                    track_index: track_idx,
+                    scene_index: scene_idx,
+                });
+            }
+
+            self.grid[track_idx][scene_idx] = target_slot;
+        }
+    }
+
+    pub fn duplicate_slot(&mut self, track_idx: usize, scene_idx: usize, audio_proxy: &AudioProxy) {
+        let target_scene = (scene_idx + 1).min(self.scenes.len() - 1);
+        if target_scene != scene_idx {
+            let current_slot = self.grid[track_idx][scene_idx].clone();
+            let mut clip_copy = current_slot;
+            
+            let next_id = self.next_clip_id;
+            self.next_clip_id += 1;
+
+            if let Some(clip) = clip_copy.clip.as_mut() {
+                clip.id = next_id;
+                let path_str = clip.path.to_string_lossy().to_string();
+                audio_proxy.send(GuiCommand::LoadClip {
+                    clip_id: next_id,
+                    path: path_str,
+                    position_secs: 0.0,
+                    duration_secs: 0.0,
+                    offset_secs: 0.0,
+                    track_index: track_idx,
+                    scene_index: target_scene,
+                });
+            }
+            self.grid[track_idx][target_scene] = clip_copy;
+        }
+    }
+
+    pub fn delete_slot(&mut self, track_idx: usize, scene_idx: usize, _audio_proxy: &AudioProxy) {
+        if let Some(slot) = self.grid.get_mut(track_idx).and_then(|r| r.get_mut(scene_idx)) {
+            *slot = MatrixSlot::default();
+        }
+    }
 }
 
 pub(crate) fn trigger_pad(state: &mut SessionMatrixState, audio_proxy: &AudioProxy, track_idx: usize, scene_idx: usize) {
@@ -274,6 +347,7 @@ pub fn poll_engine_slots(state: &mut SessionMatrixState, engine: &AudioEngine) -
 pub fn show(
     ui: &mut Ui,
     state: &mut SessionMatrixState,
+    clipboard: &mut MatrixClipboard,
     dragged_sample: &mut Option<PathBuf>,
     audio_proxy: &AudioProxy,
     _current_tick: u64,
@@ -297,7 +371,7 @@ pub fn show(
         }
     }
     ui.horizontal(|ui| {
-        ui.heading("SESSION MATRIX"); // LOCO, no cambiés esto por nada en el mundo
+        ui.heading("SESSION MATRIX");
         ui.add_space(20.0);
 
         ui.group(|ui| {
@@ -437,7 +511,7 @@ pub fn show(
                                 });
 
                             for scene_idx in 0..state.scenes.len() {
-                                render_pad(ui, state, dragged_sample, audio_proxy, track_idx, scene_idx, bpm);
+                                render_pad(ui, state, clipboard, dragged_sample, audio_proxy, track_idx, scene_idx, bpm);
                             }
 
                             ui.end_row();
@@ -492,6 +566,7 @@ pub fn show(
 fn render_pad(
     ui: &mut Ui,
     state: &mut SessionMatrixState,
+    clipboard: &mut MatrixClipboard,
     dragged_sample: &mut Option<PathBuf>,
     audio_proxy: &AudioProxy,
     track_idx: usize,
@@ -500,6 +575,7 @@ fn render_pad(
 ) {
     let slot = &state.grid[track_idx][scene_idx];
     let is_selected = state.selected_slot == Some((track_idx, scene_idx));
+    let has_clip = slot.clip.is_some();
 
     let (bg_color, mut border_color, text) = match &slot.state {
         SlotState::Empty => (Color32::from_gray(25), Color32::from_gray(40), "".to_string()),
@@ -554,6 +630,32 @@ fn render_pad(
         }
     }
 
+    response.context_menu(|ui| {
+        ui.style_mut().spacing.button_padding = Vec2::new(8.0, 4.0);
+
+        if ui.add_enabled(has_clip, Button::new("📋 Copiar")).clicked() {
+            state.copy_slot(track_idx, scene_idx, clipboard);
+            ui.close_menu();
+        }
+        if ui.add_enabled(has_clip, Button::new("✂ Cortar")).clicked() {
+            state.cut_slot(track_idx, scene_idx, clipboard, audio_proxy);
+            ui.close_menu();
+        }
+        if ui.add_enabled(clipboard.has_content(), Button::new("📥 Pegar")).clicked() {
+            state.paste_slot(track_idx, scene_idx, clipboard, audio_proxy);
+            ui.close_menu();
+        }
+        ui.separator();
+        if ui.add_enabled(has_clip, Button::new("📑 Duplicar")).clicked() {
+            state.duplicate_slot(track_idx, scene_idx, audio_proxy);
+            ui.close_menu();
+        }
+        if ui.add_enabled(has_clip, Button::new("🗑 Eliminar")).clicked() {
+            state.delete_slot(track_idx, scene_idx, audio_proxy);
+            ui.close_menu();
+        }
+    });
+
     if response.clicked() {
         state.selected_slot = Some((track_idx, scene_idx));
         trigger_pad(state, audio_proxy, track_idx, scene_idx);
@@ -590,54 +692,20 @@ fn render_clip_editor_track_view(
     audio_proxy: &AudioProxy,
     bpm: f64,
     sample_rate: u32,
-    transport_sample_count: u64,
-    ppqn: u64,
+    _transport_sample_count: u64,
+    _ppqn: u64,
     _global_loop_enabled: bool,
     _global_loop_start_ticks: u64,
     _global_loop_end_ticks: u64,
     engine_handle: Option<&Arc<Mutex<AudioEngine<'static>>>>,
 ) {
-    let playhead_override_ticks: Option<u64> = (|| {
-        let (track_idx, scene_idx) = state.selected_slot?;
-        let handle = engine_handle?;
-        let engine = handle.try_lock().ok()?;
-        let elapsed = engine.voice_elapsed_frames(track_idx, scene_idx)?;
-        let sr = sample_rate as f64;
-        if sr <= 0.0 || bpm <= 0.0 {
-            return None;
-        }
-        let seconds_per_tick = (60.0 / bpm) / ppqn.max(1) as f64;
-        if seconds_per_tick <= 0.0 {
-            return None;
-        }
-        Some(((elapsed as f64 / sr) / seconds_per_tick).round() as u64)
-    })();
-
-    if let (Some(tick), Some((track_idx, scene_idx))) =
-        (playhead_override_ticks, state.selected_slot)
-    {
-        if let Some(slot) = state
-            .grid
-            .get_mut(track_idx)
-            .and_then(|r| r.get_mut(scene_idx))
-        {
-            if slot.state == SlotState::Playing {
-                if let Some(clip) = slot.clip.as_mut() {
-                    let ticks_per_bar = ppqn.max(1) as f64 * 4.0;
-                    clip.local_bar = (tick as f64 / ticks_per_bar) as f32 + 1.0;
-                }
-                ui.ctx().request_repaint();
-            }
-        }
-    }
-
     Frame::none()
         .fill(Color32::from_rgb(20, 20, 24))
         .stroke(Stroke::new(1.0_f32, Color32::from_gray(45)))
         .show(ui, |ui| {
             let Some((track_idx, scene_idx)) = state.selected_slot else {
                 ui.centered_and_justified(|ui| {
-                    ui.label("Seleccioná un clip de la matriz para desplegar su Track Editor.");
+                    ui.label("Seleccioná un clip de la matriz para desplegar su Clip Editor.");
                 });
                 return;
             };
@@ -646,9 +714,9 @@ fn render_clip_editor_track_view(
                 return;
             }
 
-            if state.grid[track_idx][scene_idx].clip.is_none() {
+            let Some(slot) = &mut state.grid[track_idx][scene_idx].clip else {
                 ui.horizontal(|ui| {
-                    ui.heading("CLIP TRACK EDITOR");
+                    ui.heading("CLIP EDITOR");
                     ui.label(format!(
                         "- {} | {}",
                         state.tracks[track_idx].name, state.scenes[scene_idx].name
@@ -659,70 +727,26 @@ fn render_clip_editor_track_view(
                     ui.label("Slot vacío. Arrastrá un sample para crear un Clip.");
                 });
                 return;
+            };
+
+            // Consultar fotogramas transcurridos en tiempo real al motor de audio
+            let elapsed_frames = (|| {
+                let handle = engine_handle?;
+                let engine = handle.try_lock().ok()?;
+                engine.voice_elapsed_frames(track_idx, scene_idx)
+            })();
+
+            if elapsed_frames.is_some() {
+                ui.ctx().request_repaint();
             }
 
-            let title = format!(
-                "CLIP TRACK EDITOR - {} | {}",
-                state.tracks[track_idx].name, state.scenes[scene_idx].name
-            );
-
-            let clip = state.grid[track_idx][scene_idx].clip.as_mut().unwrap();
-            let mut local_tracks = vec![clip.local_track.clone()];
-
-            playlist::show_embedded(
+            // Llamar al nuevo editor modularizado limpio
+            clip_editor::show(
                 ui,
-                &mut clip.local_state,
-                &mut local_tracks,
-                &mut clip.local_bar,
-                dragged_sample,
-                audio_proxy,
-                bpm,
+                slot,
+                elapsed_frames,
                 sample_rate,
-                &title,
-                transport_sample_count,
-                4,
-                playhead_override_ticks,
             );
-
-            if let Some(updated_track) = local_tracks.into_iter().next() {
-                clip.local_track = updated_track;
-            }
-
-            if clip.local_state.loop_drag_completed_this_frame {
-                let ppqn = clip.local_state.ppqn.max(1) as f64;
-                let (new_start, new_end, new_enabled) = if clip.local_state.is_loop_region_valid() {
-                    (
-                        clip.local_state.loop_start_ticks,
-                        clip.local_state.loop_end_ticks,
-                        true,
-                    )
-                } else {
-                    (clip.loop_start, clip.loop_end, false)
-                };
-
-                if new_start != clip.loop_start
-                    || new_end != clip.loop_end
-                    || new_enabled != clip.loop_enabled
-                {
-                    clip.loop_start = new_start;
-                    clip.loop_end = new_end;
-                    clip.loop_enabled = new_enabled;
-
-                    let seconds_per_tick = if bpm > 0.0 {
-                        (60.0_f64 / bpm) / ppqn
-                    } else {
-                        0.0_f64
-                    };
-
-                    audio_proxy.send(GuiCommand::SetClipLoop {
-                        track_idx,
-                        scene_idx,
-                        loop_start_secs: (new_start as f64 * seconds_per_tick) as f32,
-                        loop_end_secs: (new_end as f64 * seconds_per_tick) as f32,
-                        enabled: new_enabled,
-                    });
-                }
-            }
         });
 }
 
